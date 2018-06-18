@@ -1,29 +1,87 @@
-import ruamel.yaml as yaml
-import re
-import sys
+import argparse
 import copy
 import os
 import os.path as path
-import argparse
+import re
+import shutil
+import sys
+
+import pkg_resources
+import ruamel.yaml as yaml
+
+os.getcwd
 
 def dict_map(func, d):
     return dict([func(key, value) for key, value in d.items()])
 
 EXPR_SYMBOL = "__exprs"
 
-def unjsify_workflow(workflow_location: str, output_dir: str, capdir: str):
+def get_cwl_map(cwl_map, name, id_token):
+    if isinstance(cwl_map, dict):
+        return cwl_map.get(name)
+    else:
+        for requirement in cwl_map:
+            if requirement[id_token] == name:
+                return requirement
+
+def remove_cwl_map(cwl_map, name, id_token):
+    if isinstance(cwl_map, dict):
+        del cwl_map[name]
+    else:
+        for requirement in cwl_map:
+            if requirement[id_token] == name:
+                cwl_map.remove(requirement)
+
+def add_cwl_map(cwl_map, name, id_token, object=None):
+    if object is None:
+        object = {}
+
+    if isinstance(cwl_map, dict):
+        cwl_map[name] = object
+    else:
+        object[id_token] = name
+
+        cwl_map.append(object)
+
+    return object
+
+
+def is_path_in(test_path, containing_path):
+    return path.commonpath([path.abspath(test_path), path.abspath(containing_path)]) == path.abspath(containing_path)
+
+def unjsify(workflow_location: str, outdir: str, base_cwldir: str):
+    if not path.isdir(outdir):
+        os.mkdir(outdir)
+
+    with open(path.join(outdir, "eval_exprs.cwl"), "wb+") as eval_exprs_dest:
+        with pkg_resources.resource_stream(__name__, "eval_exprs.cwl") as eval_exprs_source:
+            shutil.copyfileobj(eval_exprs_source, eval_exprs_dest)
+
+    return unjsify_workflow(workflow_location, outdir, base_cwldir)
+
+def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
+    print(f"Processing {workflow_location}")
     def write_new_cwl(old_location, cwl):
-        out_file = path.join(output_dir, path.basename(old_location))
-        if path.commonpath([out_file, capdir]) != capdir:
-            raise Exception(f"Cannot write to {out_file}, it is out of the capdir of {capdir}")
+        if not is_path_in(old_location, base_cwldir):
+            raise Exception(f"Invalid reference to file {old_location}, outside the basedir of {base_cwldir}")
+
+        out_file = path.join(outdir, path.relpath(old_location, base_cwldir))
+
+        os.makedirs(path.dirname(out_file), exist_ok=True)
 
         with open(out_file, "w") as output_file:
-            yaml.dump(cwl, output_file)
+            yaml.dump(cwl, output_file, default_flow_style=False)
 
     with open(workflow_location) as workflow_file:
         workflow_cwl = yaml.load(workflow_file, Loader=yaml.Loader)
 
     new_workflow_cwl = copy.deepcopy(workflow_cwl)
+
+    if "requirements" not in new_workflow_cwl:
+        new_workflow_cwl["requirements"] = []
+
+    # this is needed to pass multiple inputs to the expression evaluation step
+    add_cwl_map(new_workflow_cwl["requirements"], "MultipleInputFeatureRequirement", "class")
 
     for i, step in enumerate(workflow_cwl["steps"]):
         step_run_location = step["run"]
@@ -33,24 +91,15 @@ def unjsify_workflow(workflow_location: str, output_dir: str, capdir: str):
             step_cwl = yaml.load(fp, Loader=yaml.Loader)
 
         if step_cwl["class"] == "CommandLineTool":
-            for requirement in step_cwl["requirements"]:
-                if requirement["class"] == "InlineJavascriptRequirement":
-                    has_inline_js = True
-                    expressionLib = requirement.get("expressionLib", None)
+            js_req = get_cwl_map(step_cwl.get("requirements", []), "InlineJavascriptRequirement", "class")
 
-            if has_inline_js:
+            if js_req is not None:
                 expressions, new_tool = unjsify_tool(step_cwl)
                 write_new_cwl(step_run_location, new_tool)
-                if "requirements" not in new_workflow_cwl:
-                    new_workflow_cwl["requirements"] = []
-
-                new_workflow_cwl["requirements"].append({
-                    "class": "MultipleInputFeatureRequirement"
-                })
 
                 new_workflow_cwl["steps"].insert(i, {
                     "id": "pre_" + step["id"],
-                    "run": "./eval_exprs.cwl",
+                    "run": path.relpath(path.join(base_cwldir, "eval_exprs.cwl"), path.dirname(workflow_location)), "eval_exprs.cwl"),
                     "in": {
                         "input_values": {
                             "source": list(step["in"].values())
@@ -65,20 +114,17 @@ def unjsify_workflow(workflow_location: str, output_dir: str, capdir: str):
                     "out": ["output"]
                 })
 
-                if expressionLib is not None:
-                    new_workflow_cwl["steps"][i]["in"]["expressionLib"] = ";".join(expressionLib)
+                if js_req.get("expressionLib") is not None:
+                    new_workflow_cwl["steps"][i]["in"]["expressionLib"] = ";".join(js_req["expressionLib"])
 
                 new_workflow_cwl["steps"][i + 1]["in"][EXPR_SYMBOL] = f"pre_{step['id']}/output"
+            else:
+                write_new_cwl(step_run_location, step_cwl)
         elif step_cwl["class"] == "Workflow":
-            new_outdir = path.dirname(path.relpath(step_run_location, output_dir))
-            if path.commonpath([new_outdir, capdir]) != capdir:
-                raise Exception(f"Cannot write to {new_outdir}, it is out of the capdir of {capdir}")
-
-            os.makedirs(new_outdir, exist_ok=True)
-
-            unjsify_workflow(step_run_location, new_outdir, capdir)
+            unjsify_workflow(step_run_location, outdir, base_cwldir)
         elif step_cwl["class"] == "ExpressionTool":
-            raise NotImplementedError()
+            write_new_cwl(step_run_location, step_cwl)
+            print(f"Not transforming ExpressionTool file {step_run_location}")
 
     write_new_cwl(workflow_location, new_workflow_cwl)
 
@@ -109,18 +155,14 @@ def unjsify_tool(cwl):
         else:
             return node
 
-    cwl["inputs"].insert(0, {
-        "id": EXPR_SYMBOL,
+    add_cwl_map(cwl["inputs"], EXPR_SYMBOL, "id", {
         "type": {
             "type": "array",
             "items": "Any"
         }
     })
 
-
-    for requirement in cwl["requirements"]:
-        if requirement["class"] == "InlineJavascriptRequirement":
-            cwl["requirements"].remove(requirement)
+    remove_cwl_map(cwl["requirements"], "InlineJavascriptRequirement", "class")
 
     inplace_nested_map(visit_cwl_node, cwl)
 
@@ -128,14 +170,15 @@ def unjsify_tool(cwl):
 
 def main():
     parser = argparse.ArgumentParser("unjsify")
-    parser.add_argument("cwl_workflow", required=True, help="Initial CWL workflow file to unjsify.")
+    parser.add_argument("cwl_workflow", help="Initial CWL workflow file to unjsify.")
+    parser.add_argument("-b", "--base-dir", help="Base directory for the CWL files")
     parser.add_argument("-o", "--output", required=True, help="Output directory for results.")
     args = parser.parse_args()
 
-    if path.isdir(args.output):
-        os.mkdir(args.output)
+    if args.base_dir is None:
+        args.base_dir = path.dirname(args.output)
 
-    unjsify_workflow(args.cwl_workflow, args.output, args.output)
+    unjsify(args.cwl_workflow, args.output, args.base_dir)
 
 if __name__ == "__main__":
     main()
