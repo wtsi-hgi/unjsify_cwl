@@ -92,6 +92,8 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
     # this is needed to pass multiple inputs to the expression evaluation step
     add_cwl_map(new_workflow_cwl["requirements"], "MultipleInputFeatureRequirement", "class")
 
+    eval_exprs_location = path.relpath(path.join(base_cwldir, "eval_exprs.cwl"), path.dirname(workflow_location))
+
     for i, step in enumerate(workflow_cwl["steps"]):
         step_run_location = step["run"]
         if not path.isabs(step_run_location):
@@ -103,47 +105,85 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
             js_req = get_cwl_map(step_cwl.get("requirements", []), "InlineJavascriptRequirement", "class")
 
             if js_req is not None:
-                expressions, new_tool = unjsify_tool(step_cwl)
+                input_expressions, output_expressions, data_by_outputId, new_tool = unjsify_tool(step_cwl)
                 write_new_cwl(step_run_location, new_tool)
+
+                def get_output_from_name(output_name):
+                    if data_by_outputId.get(output_name) is not None:
+                        return (output_name, {
+                            "outputSource": '__output_eval_exprs/output',
+                            "outputBinding": {
+                                "outputEval": data_by_outputId[output_name]["outputEval"]
+                            },
+                            "type": data_by_outputId[output_name]["type"]
+                        })
+                    return (output_name, {
+                        "type": "Any",
+                        "outputSource": f'{step["id"]}/{output_name}'
+                    })
 
                 new_workflow_cwl["steps"][i]["run"] = {
                     "class": "Workflow",
                     "inputs": dict(map(lambda input_name: (input_name, {
                         "type": "Any"
                     }), step["in"].keys())),
-                    "outputs": dict(map(lambda output_name: (output_name, {
-                        "type": "Any",
-                        "outputSource": f'{step["id"]}/{output_name}'
-                    }), step["out"])),
-                    "steps": {
-                        "__eval_exprs": {
-                            "run": path.relpath(path.join(base_cwldir, "eval_exprs.cwl"), path.dirname(workflow_location)),
-                            "in": update_dict(
-                                {
-                                    "input_values": {
-                                        "source": list(step["in"].keys())
+                    "outputs": dict(map(get_output_from_name, step["out"])),
+                    "steps": update_dict(
+                        {
+                            "__eval_exprs": {
+                                "run": eval_exprs_location,
+                                "in": update_dict(
+                                    {
+                                        "input_values": {
+                                            "source": list(step["in"].keys())
+                                        },
+                                        "input_names": {
+                                            "default": list(step["in"].keys())
+                                        },
+                                        "expressions": {
+                                            "default": input_expressions
+                                        }
                                     },
-                                    "input_names": {
-                                        "default": list(step["in"].keys())
-                                    },
-                                    "expressions": {
-                                        "default": expressions
-                                    }
-                                },
-                                [("expressionLib", {"default": ";".join(js_req["expressionLib"])})] \
-                                    if js_req.get("expressionLib") is not None else []
-                            ),
-                            "out": ["output"]
+                                    [("expressionLib", {"default": ";".join(js_req["expressionLib"])})] \
+                                        if js_req.get("expressionLib") is not None else []
+                                ),
+                                "out": ["output"]
+                            },
+                            step["id"]: {
+                                "in": update_dict(
+                                    dict(zip(step["in"].keys(), step["in"].keys())),
+                                    [(EXPR_SYMBOL, "__eval_exprs/output")]
+                                ),
+                                "out": step["out"],
+                                "run": step["run"]
+                            }
                         },
-                        step["id"]: {
-                            "in": update_dict(
-                                dict(zip(step["in"].keys(), step["in"].keys())),
-                                [(EXPR_SYMBOL, "__eval_exprs/output")]
-                            ),
-                            "out": step["out"],
-                            "run": step["run"]
+                        {} if output_expressions == []
+                        else {
+                            "__output_eval_exprs": {
+                                "run": eval_exprs_location,
+                                "in": update_dict(
+                                    {
+                                        "input_values": {
+                                            "source": list(map(lambda x: step["id"] + "/" + x["outputId"], output_expressions))
+                                        },
+                                        "input_names": {
+                                            "default": list(map(lambda x: "__output_" + x["outputId"], output_expressions))
+                                        },
+                                        "expressions": {
+                                            "default": list(map(lambda x: {
+                                                "expr": x["expr"],
+                                                "self": "__output_" + x["outputId"]
+                                            }, output_expressions))
+                                        }
+                                    },
+                                    [("expressionLib", {"default": ";".join(js_req["expressionLib"])})] \
+                                        if js_req.get("expressionLib") is not None else []
+                                ),
+                                "out": ["output"]
+                            }
                         }
-                    }
+                    )
                 }
             else:
                 write_new_cwl(step_run_location, step_cwl)
@@ -168,8 +208,7 @@ def inplace_nested_map(func, struct):
         return func(struct)
 
 def unjsify_tool(cwl):
-    expressions = []
-    def replace_expr(self_value, node):
+    def replace_expr(node, on_found_expr):
         value_arr = list(node)
         unscanned_str = node
         scan_slice = scan_expression(unscanned_str)
@@ -178,29 +217,63 @@ def unjsify_tool(cwl):
             if unscanned_str[scan_slice[0]] == '$':
                 expression = unscanned_str[scan_slice[0]:scan_slice[1]]
                 if not is_parameter_reference(unscanned_str[scan_slice[0]+2:scan_slice[1]-1]):
-                    expressions.append({"self": self_value, "expr": expression})
-                    value_arr[scan_slice[0]+2:scan_slice[1]-1] = \
-                        list(f"inputs.{EXPR_SYMBOL}[{len(expressions) - 1}]")
+                    value_arr[scan_slice[0]+2:scan_slice[1]-1] = list(on_found_expr(expression))
+                    # expr_arr.append({"self": self_value, "expr": expression})
+                    # value_arr[scan_slice[0]+2:scan_slice[1]-1] = \
+                    #     list(f"inputs.{EXPR_SYMBOL}[{len(expr_arr) - 1}]")
 
             unscanned_str = unscanned_str[scan_slice[1]:]
             scan_slice = scan_expression(unscanned_str)
 
         return "".join(value_arr)
 
+    input_expressions = []
+    output_expressions = []
     for _input in cwl["inputs"]:
         if isinstance(_input, str):
             input = cwl["inputs"][_input]
             input_id = _input
         else:
             input = _input
-            input_id = input["id"]
+            input_id = _input["id"]
+
+        def on_found_input_expr(expression):
+            input_expressions.append({"self": input_id, "expr": expression})
+            return f"inputs.{EXPR_SYMBOL}[{len(input_expressions) - 1}]"
 
         if input.get("inputBinding", {}).get("valueFrom") is not None:
-            input["inputBinding"]["valueFrom"] = replace_expr(input_id, input["inputBinding"]["valueFrom"])
+            input["inputBinding"]["valueFrom"] = replace_expr(input["inputBinding"]["valueFrom"], on_found_input_expr)
+
+    data_by_outputId = {}
+
+    for _output in cwl["outputs"]:
+        if isinstance(_output, str):
+            output = cwl["outputs"][_output]
+            output_id = _output
+        else:
+            output = _output
+            output_id = _output["id"]
+
+        def on_found_output_expr(expression):
+            output_expressions.append({"outputId": output_id, "expr": expression})
+            return f"self[{len(output_expressions) - 1}]"
+
+        if output.get("outputBinding", {}).get("outputEval") is not None:
+            output["outputBinding"]["outputEval"] = replace_expr(output["outputBinding"]["outputEval"], on_found_output_expr)
+            data_by_outputId[output_id] = {
+                "outputEval": output["outputBinding"]["outputEval"],
+                "type": output["type"]
+            }
+            del output["outputBinding"]["outputEval"]
+            output["type"] = "Any"
+
+    def on_found_expr(expression):
+        input_expressions.append({"self": None, "expr": expression})
+        return f"inputs.{EXPR_SYMBOL}[{len(input_expressions) - 1}]"
 
     def visit_cwl_node(node):
         if isinstance(node, str):
-            return replace_expr(None, node)
+            return replace_expr(node, on_found_expr)
         else:
             return node
 
@@ -215,7 +288,7 @@ def unjsify_tool(cwl):
 
     inplace_nested_map(visit_cwl_node, cwl)
 
-    return expressions, cwl
+    return input_expressions, output_expressions, data_by_outputId, cwl
 
 def main():
     parser = argparse.ArgumentParser("unjsify")

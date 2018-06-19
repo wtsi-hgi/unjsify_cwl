@@ -53,7 +53,7 @@ requirements:
 
             return require("vm").runInNewContext(expressionLib + ";" + expression.expr, {
                 inputs: inputs,
-                self: expression.self,
+                self: expression.self == null?null:inputs[expression.self],
                 runtime: undefined
             });
           })
