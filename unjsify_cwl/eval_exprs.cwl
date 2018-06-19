@@ -7,8 +7,8 @@ requirements:
     listing:
       - entryname: input_values.json
         entry: '{"input_values": $(inputs.input_values)}'
-      - entryname: input_names.json
-        entry: '{"input_names": $(inputs.input_names)}'
+      - entryname: input_mappings.json
+        entry: '{"input_mappings": $(inputs.input_mappings)}'
       - entryname: expressions.json
         entry: '{"expressions": $(inputs.expressions)}'
       - entryname: expressionLib.js
@@ -19,15 +19,19 @@ requirements:
           const vm = require("vm");
 
           const input_values = JSON.parse(fs.readFileSync("input_values.json"))["input_values"];
-          const input_names = JSON.parse(fs.readFileSync("input_names.json"))["input_names"];
+          const input_mappings = JSON.parse(JSON.parse(fs.readFileSync("input_mappings.json"))["input_mappings"]);
           const expressions = JSON.parse(fs.readFileSync("expressions.json"))["expressions"];
           const expressionLib = fs.readFileSync("expressionLib.js");
 
-          if(input_values.length !== input_names.length){
-            throw Error(input_values.length + "!==" + input_names.length)
-          }
-
           let inputs = {};
+          Object.entries(input_mappings).forEach(([input_key, input_value_i], i) => {
+            if(typeof input_value_i == "number"){
+              inputs[input_key] = input_values[input_value_i];
+            }
+            else{
+              inputs[input_key] = input_value_i.map(x => input_values[x]);
+            }
+          })
           inputs_values.forEach((input_value, i) => {
             inputs[input_names[i]] = input_value;
           })
@@ -48,6 +52,8 @@ requirements:
               expression = expression.slice(2, -1);
 
             return require("vm").runInNewContext(expressionLib + ";" + expression, {
+                runtime: undefined,
+                self: undefined,
                 inputs:inputs
             });
           })
@@ -65,16 +71,13 @@ inputs:
     type:
       type: array
       items:  Any
-  - id: input_names
-    type:
-      type: array
-      items: string
+  - id: input_mappings
+    type: string
   - id: expressions
     type: Any
   - id: expressionLib
     default: ""
     type: string?
-
 outputs:
   - id: output
     type: Any

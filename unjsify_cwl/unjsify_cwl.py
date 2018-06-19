@@ -1,15 +1,19 @@
 import argparse
 import copy
+import itertools
+import json
 import os
 import os.path as path
 import re
 import shutil
 import sys
+from typing import Any, Dict
 
 import pkg_resources
 import ruamel.yaml as yaml
 
-os.getcwd
+from .get_expressions import scan_expression
+
 
 def dict_map(func, d):
     return dict([func(key, value) for key, value in d.items()])
@@ -59,6 +63,11 @@ def unjsify(workflow_location: str, outdir: str, base_cwldir: str):
 
     return unjsify_workflow(workflow_location, outdir, base_cwldir)
 
+
+def update_dict(d: dict, new_values):
+    d.update(new_values)
+    return d
+
 def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
     print(f"Processing {workflow_location}")
     def write_new_cwl(old_location, cwl):
@@ -97,15 +106,84 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                 expressions, new_tool = unjsify_tool(step_cwl)
                 write_new_cwl(step_run_location, new_tool)
 
+                input_values_set = set()
+                input_mappings = {} # type: Dict[str, Any]
+                for in_key, in_value in step["in"].items():
+                    if isinstance(in_value, dict) and in_value.keys() == ["source"]:
+                        in_value = in_value["source"]
+
+                    if isinstance(in_value, dict):
+                        if in_value.keys() == ["default"]:
+                            input_mappings[in_key] = in_value
+                        else:
+                            raise NotImplementedError(workflow_location)
+                            in_value = "NOT IMPLEMENTED"
+                    elif isinstance(in_value, str):
+                        input_values_set.add(in_value)
+                        input_mappings[in_key] = in_value
+                    elif isinstance(in_value, list):
+                        input_values_set = input_values_set.union(in_value)
+                        input_mappings[in_key] = in_value
+                    else:
+                        raise Exception("Unknown in_value")
+
+                input_values_list = list(input_values_set)
+                inverse_input_values_list = dict(zip(input_values_list, itertools.count()))
+
+                for input_mapping_key, input_mapping_value in input_mappings.items():
+                    if isinstance(input_mapping_value, str):
+                        input_mappings[input_mapping_key] = inverse_input_values_list[input_mapping_value]
+                    else:
+                        for i, v in enumerate(input_mapping_value):
+                            input_mapping_value[i] = inverse_input_values_list[v]
+
+                new_workflow_cwl["steps"][i]["run"] = {
+                    "class": "Workflow",
+                    "inputs": dict(map(lambda input_name: (input_name, {
+                        "type": "Any"
+                    }), step["in"].keys())),
+                    "outputs": dict(map(lambda output_name: (output_name, {
+                        "type": "Any",
+                        "outputSource": f'{step["id"]}/{output_name}'
+                    }), step["out"])),
+                    "steps": {
+                        "__eval_exprs": {
+                            "run": path.relpath(path.join(base_cwldir, "eval_exprs.cwl"), path.dirname(workflow_location)),
+                            "in": update_dict(
+                                {
+                                    "input_values": {
+                                        "source": step["in"].keys()
+                                    },
+                                    "input_names": {
+                                        "default": step["in"].keys()
+                                    },
+                                    "expressions": {
+                                        "default": expressions
+                                    }
+                                },
+                                [("expressionLib", ";".join(js_req["expressionLib"])] \
+                                    if js_req.get("expressionLib") is not None else []
+                            ),
+                            "out": ["output"]
+                        },
+                        step["id"]: {
+                            "in": update_dict(
+                                dict(zip(step["in"].keys(), step["in"].keys())),
+                                [(EXPR_SYMBOL, "__eval_exprs/output")]
+                            )
+                        }
+                    }
+                }
+
                 new_workflow_cwl["steps"].insert(i, {
                     "id": "pre_" + step["id"],
-                    "run": path.relpath(path.join(base_cwldir, "eval_exprs.cwl"), path.dirname(workflow_location)), "eval_exprs.cwl"),
+                    "run": path.relpath(path.join(base_cwldir, "eval_exprs.cwl"), path.dirname(workflow_location)),
                     "in": {
                         "input_values": {
-                            "source": list(step["in"].values())
+                            "source": input_values_list
                         },
-                        "input_names": {
-                            "default": list(step["in"].keys())
+                        "input_mappings": {
+                            "default": json.dumps(input_mappings)
                         },
                         "expressions": {
                             "default": expressions
@@ -145,11 +223,18 @@ def unjsify_tool(cwl):
     def visit_cwl_node(node):
         if isinstance(node, str):
             value_arr = list(node)
-            for re_expr in re.finditer(r"\$\((.*?)\)", node):
+            unscanned_str = node
+            scan_slice = scan_expression(unscanned_str)
 
-                expressions.append(re_expr.groups()[0])
-                value_arr[re_expr.span()[0]+2:re_expr.span()[0]-1] = \
-                    list(f"inputs.{EXPR_SYMBOL}[{len(expressions) - 1}]")
+            while scan_slice:
+                if unscanned_str[scan_slice[0]] == '$':
+                    expression = unscanned_str[scan_slice[0]:scan_slice[1]]
+                    expressions.append(expression)
+                    value_arr[scan_slice[0]+2:scan_slice[1]-1] = \
+                        list(f"inputs.{EXPR_SYMBOL}[{len(expressions) - 1}]")
+
+                unscanned_str = unscanned_str[scan_slice[1]:]
+                scan_slice = scan_expression(unscanned_str)
 
             return "".join(value_arr)
         else:
