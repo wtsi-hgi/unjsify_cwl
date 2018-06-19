@@ -1,14 +1,14 @@
 cwlVersion: v1.0
 class: CommandLineTool
-doc: Transpose a given matrix
+doc: Evaluate a series of JavaScript expressions
 
 requirements:
   InitialWorkDirRequirement:
     listing:
       - entryname: input_values.json
         entry: '{"input_values": $(inputs.input_values)}'
-      - entryname: input_mappings.json
-        entry: '{"input_mappings": $(inputs.input_mappings)}'
+      - entryname: input_names.json
+        entry: '{"input_names": $(inputs.input_names)}'
       - entryname: expressions.json
         entry: '{"expressions": $(inputs.expressions)}'
       - entryname: expressionLib.js
@@ -19,20 +19,20 @@ requirements:
           const vm = require("vm");
 
           const input_values = JSON.parse(fs.readFileSync("input_values.json"))["input_values"];
-          const input_mappings = JSON.parse(JSON.parse(fs.readFileSync("input_mappings.json"))["input_mappings"]);
+          const input_names = JSON.parse(fs.readFileSync("input_names.json"))["input_names"];
           const expressions = JSON.parse(fs.readFileSync("expressions.json"))["expressions"];
           const expressionLib = fs.readFileSync("expressionLib.js");
 
+          if(typeof input_values !== "object"){
+            input_values = [input_values];
+          }
+
+          if(input_values.length !== input_names.length){
+            throw Error(input_values.length + "!==" + input_names.length)
+          }
+
           let inputs = {};
-          Object.entries(input_mappings).forEach(([input_key, input_value_i], i) => {
-            if(typeof input_value_i == "number"){
-              inputs[input_key] = input_values[input_value_i];
-            }
-            else{
-              inputs[input_key] = input_value_i.map(x => input_values[x]);
-            }
-          })
-          inputs_values.forEach((input_value, i) => {
+          input_values.forEach((input_value, i) => {
             inputs[input_names[i]] = input_value;
           })
 
@@ -46,15 +46,15 @@ requirements:
           })
 
           const new_expressions = expressions.map((expression) => {
-            if(expression[1] == "{")
-              expression = "(() => {" + expression.slice(2, -1) + "})()";
+            if(expression.expr[1] == "{")
+              expression.expr = "(() => {" + expression.expr.slice(2, -1) + "})()";
             else
-              expression = expression.slice(2, -1);
+              expression.expr = expression.expr.slice(2, -1);
 
-            return require("vm").runInNewContext(expressionLib + ";" + expression, {
-                runtime: undefined,
-                self: undefined,
-                inputs:inputs
+            return require("vm").runInNewContext(expressionLib + ";" + expression.expr, {
+                inputs: inputs,
+                self: expression.self,
+                runtime: undefined
             });
           })
 
@@ -68,16 +68,17 @@ baseCommand:
 
 inputs:
   - id: input_values
+    type: Any
+  - id: input_names
     type:
       type: array
-      items:  Any
-  - id: input_mappings
-    type: string
+      items: string
   - id: expressions
     type: Any
   - id: expressionLib
     default: ""
     type: string?
+
 outputs:
   - id: output
     type: Any
