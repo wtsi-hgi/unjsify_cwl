@@ -23,7 +23,7 @@ requirements:
           const expressions = JSON.parse(fs.readFileSync("expressions.json"))["expressions"];
           const expressionLib = fs.readFileSync("expressionLib.js");
 
-          if(typeof input_values !== "object"){
+          if(!Array.isArray(input_values)){
             input_values = [input_values];
           }
 
@@ -61,6 +61,7 @@ requirements:
                 runtime: undefined
             });
           })
+          console.log(new_expressions)
 
           fs.writeFileSync("cwl.output.json", JSON.stringify({
             output:new_expressions

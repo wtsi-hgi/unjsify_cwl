@@ -11,7 +11,6 @@ from typing import Any, Dict
 import types
 import tempfile
 import logging
-from cwltool.load_tool import fetch_document, validate_document, resolve_tool_uri
 
 import pkg_resources
 import ruamel.yaml as yaml
@@ -271,9 +270,10 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                         return f"inputs.{OUTPUT_EXPR_SYMBOL}[{len(workflow_exprs) - 1}]"
 
                     new_valueFrom = replace_expr(step_in["valueFrom"], on_found_workflow_expr)
-                    del get_cwl_map(get_cwl_map(new_workflow_cwl["steps"], step_id)["in"], step_in["id"])["valueFrom"]
 
                     if found_expr:
+                        get_cwl_map(get_cwl_map(new_workflow_cwl["steps"], step_id)["in"], step_in["id"])["valueFrom"] = ""
+
                         workflow_expr_new_valuesFrom[step_in["id"]] = new_valueFrom
 
         if workflow_exprs is not None:
@@ -323,24 +323,11 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
 
         if step_cwl["class"] == "CommandLineTool":
             js_req = get_cwl_map(step_cwl.get("requirements", []), "InlineJavascriptRequirement", "class")
+            data_by_outputId = {}
 
             if js_req is not None:
                 input_expressions, output_expressions, data_by_outputId, new_tool = unjsify_tool(step_cwl)
                 write_new_cwl(step_run_location, new_tool)
-
-                def get_output_from_name(output_name):
-                    if data_by_outputId.get(output_name) is not None:
-                        return (output_name, {
-                            "outputSource": '__output_eval_exprs/output',
-                            "outputBinding": {
-                                "outputEval": data_by_outputId[output_name]["outputEval"]
-                            },
-                            "type": data_by_outputId[output_name]["type"]
-                        })
-                    return (output_name, {
-                        "type": "Any",
-                        "outputSource": f'{step_id}/{output_name}'
-                    })
 
                 if js_req.get("expressionLib") is None:
                     expression_lib_dict = {} # type: JSONType
@@ -349,23 +336,24 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                         "expressionLib": {"default": ";".join(js_req["expressionLib"])}
                     }
 
-                inputs_expr_step = {
-                    "id": EVAL_INPUT_EXPRS,
-                    "run": eval_exprs_location,
-                    "in": {
-                        "input_values": {
-                            "source": list(step["in"].keys())
+                if len(input_expressions) != 0:
+                    inputs_expr_step = {
+                        "id": EVAL_INPUT_EXPRS,
+                        "run": eval_exprs_location,
+                        "in": {
+                            "input_values": {
+                                "source": list(step["in"].keys())
+                            },
+                            "input_names": {
+                                "default": list(step["in"].keys())
+                            },
+                            "expressions": {
+                                "default": input_expressions
+                            },
+                            **expression_lib_dict
                         },
-                        "input_names": {
-                            "default": list(step["in"].keys())
-                        },
-                        "expressions": {
-                            "default": input_expressions
-                        },
-                        **expression_lib_dict
-                    },
-                    "out": ["output"]
-                }
+                        "out": ["output"]
+                    }
 
                 if output_expressions != []:
                     output_processing_step = {
@@ -391,6 +379,20 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
             else:
                 write_new_cwl(step_run_location, step_cwl)
 
+            def get_output_from_name(output_name):
+                if data_by_outputId.get(output_name) is not None:
+                    return (output_name, {
+                        "outputSource": f'{EVAL_OUTPUT_EXPRS}/output',
+                        "outputBinding": {
+                            "outputEval": data_by_outputId[output_name]["outputEval"]
+                        },
+                        "type": data_by_outputId[output_name]["type"]
+                    })
+                return (output_name, {
+                    "type": "Any",
+                    "outputSource": f'{step_id}/{output_name}'
+                })
+
             if any([workflow_expr_step, workflow_expr_process_step, runtime_expr_step, inputs_expr_step, output_processing_step]):
                 get_cwl_map(new_workflow_cwl["steps"], step_id, "id")["run"] = {
                     "class": "Workflow",
@@ -408,7 +410,7 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                             "in": {
                                 **dict(zip(step["in"].keys(), step["in"].keys())),
                                 **dict(zip(workflow_expr_new_valuesFrom.keys(), map(lambda x: f"{PROCESS_WORKFLOW_EXPRS}/{x}", workflow_expr_new_valuesFrom.keys()))),
-                                EXPR_SYMBOL: f"{EVAL_INPUT_EXPRS}/output"
+                                **({EXPR_SYMBOL: f"{EVAL_INPUT_EXPRS}/output"} if inputs_expr_step is not None else {})
                             },
                             "out": step["out"],
                             "run": step["run"]
@@ -480,18 +482,24 @@ def unjsify_tool(cwl):
             output = _output
             output_id = _output["id"]
 
-        def on_found_output_expr(expression):
-            output_expressions.append({"outputId": output_id, "expr": expression})
-            return f"self[{len(output_expressions) - 1}]"
-
         if output.get("outputBinding", {}).get("outputEval") is not None:
+            found_output_expression = False
+
+            def on_found_output_expr(expression):
+                nonlocal found_output_expression
+                found_output_expression = True
+                output_expressions.append({"outputId": output_id, "expr": expression})
+                return f"self[{len(output_expressions) - 1}]"
+
             output["outputBinding"]["outputEval"] = replace_expr(output["outputBinding"]["outputEval"], on_found_output_expr)
-            data_by_outputId[output_id] = {
-                "outputEval": output["outputBinding"]["outputEval"],
-                "type": output["type"]
-            }
-            del output["outputBinding"]["outputEval"]
-            output["type"] = "Any"
+
+            if found_output_expression:
+                data_by_outputId[output_id] = {
+                    "outputEval": output["outputBinding"]["outputEval"],
+                    "type": output["type"]
+                }
+                del output["outputBinding"]["outputEval"]
+                output["type"] = "Any"
 
     def on_found_expr(expression):
         input_expressions.append({"self": None, "expr": expression})
@@ -503,16 +511,17 @@ def unjsify_tool(cwl):
         else:
             return node
 
-    add_cwl_map(cwl["inputs"], EXPR_SYMBOL, "id", {
-        "type": {
-            "type": "array",
-            "items": "Any"
-        }
-    })
-
+    inplace_nested_map(visit_cwl_node, cwl)
     remove_cwl_map(cwl["requirements"], "InlineJavascriptRequirement", "class")
 
-    inplace_nested_map(visit_cwl_node, cwl)
+    if len(input_expressions) != 0:
+        add_cwl_map(cwl["inputs"], EXPR_SYMBOL, "id", {
+            "type": {
+                "type": "array",
+                "items": "Any"
+            }
+        })
+
 
     return input_expressions, output_expressions, data_by_outputId, cwl
 
