@@ -77,7 +77,10 @@ def map_to_array(cwl_map, id_token="id", secondary_symbol="source"):
         return x
 
     if isinstance(cwl_map, dict):
-        return list(map(lambda key: update_dict(to_dict(cwl_map[key]), (id_token, key)), cwl_map.keys()))
+        return list(map(lambda key: {
+            **to_dict(cwl_map[key]),
+            id_token: key
+        }, cwl_map.keys()))
     else:
         return cwl_map
 
@@ -94,10 +97,6 @@ def unjsify(workflow_location: str, outdir: str, base_cwldir: str):
 
     return unjsify_workflow(workflow_location, outdir, base_cwldir)
 
-
-def update_dict(d: dict, new_values):
-    d.update(new_values)
-    return d
 
 def frozon(json_ob):
     if isinstance(json_ob, list):
@@ -138,7 +137,7 @@ def get_cwl(cwl_path):
         with open(cwl_path) as fp:
             cwl = yaml.load(fp, Loader=yaml.Loader)
 
-        cwl_file_cache[cwl_path] = cwl
+        cwl_file_cache[cwl_path] = copy.deepcopy(cwl)
 
     if hash_pos != -1:
         return get_cwl_map(cwl["$graph"], hash_part)
@@ -165,15 +164,21 @@ def iterate(func):
 def get_identity_workflow(steps_names):
     return {
         "class": "Workflow",
-        "inputs": dict(zip(steps_names, iterate(lambda: {"type": "Any?"}))),
+        "inputs": dict(zip(map(lambda x: x + "_in", steps_names), iterate(lambda: {"type": "Any?"}))),
         "outputs":  dict(map(lambda x: (x, {
             "type": "Any?",
-            "outputSource": x
+            "outputSource": x + "_in"
         }), steps_names)),
         "steps": []
     }
 
 JSONType = Dict[str, Any]
+
+EVAL_WORKFLOW_EXPRS = "__eval_workflow_exprs"
+EVAL_WORKFLOW_EXPRS = "__eval_workflow_exprs"
+PROCESS_WORKFLOW_EXPRS = "__process_workflow_exprs"
+EVAL_INPUT_EXPRS = "__eval_input_exprs"
+EVAL_OUTPUT_EXPRS = "__eval_output_exprs"
 
 def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
     def write_new_cwl(old_location, cwl):
@@ -218,17 +223,21 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
         global cwl_file_cache
         cwl_file_cache[resolve_path(workflow_location, "__" + path.basename(workflow_location))] = get_cwl(workflow_location)
 
-    if get_cwl_map(workflow_cwl["requirements"], "InlineJavascriptRequirement", "class") is not None:
-        workflow_expression_lib = get_cwl_map(workflow_cwl["requirements"], "InlineJavascriptRequirement", "class").get("expressionLib", {})
-        remove_cwl_map(workflow_cwl["requirements"], "InlineJavascriptRequirement", "class")
-
     new_workflow_cwl = copy.deepcopy(workflow_cwl)
+
+    workflow_expression_lib = None
+    if get_cwl_map(workflow_cwl.get("requirements", {}), "InlineJavascriptRequirement", "class") is not None:
+        workflow_expression_lib = get_cwl_map(workflow_cwl["requirements"], "InlineJavascriptRequirement", "class").get("expressionLib", None)
+        remove_cwl_map(new_workflow_cwl["requirements"], "InlineJavascriptRequirement", "class")
+
 
     if "requirements" not in new_workflow_cwl:
         new_workflow_cwl["requirements"] = []
 
-    # this is needed to pass multiple inputs to the expression evaluation step
+    # this is needed to pass multiple inputs to the expression evaluation step and have subworkflows for grouping
     add_cwl_map(new_workflow_cwl["requirements"], "MultipleInputFeatureRequirement", "class")
+    add_cwl_map(new_workflow_cwl["requirements"], "SubworkflowFeatureRequirement", "class")
+    add_cwl_map(new_workflow_cwl["requirements"], "StepInputExpressionRequirement", "class")
 
     eval_exprs_location = path.relpath(path.join(base_cwldir, "eval_exprs.cwl"), path.dirname(workflow_location))
 
@@ -243,59 +252,73 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
         step_cwl = get_cwl(step_run_location)
 
         #### Init steps
-        workflow_expr_step = {} # type: JSONType
-        workflow_expr_process_step = {} # type: JSONType
-        runtime_expr_step = {} # type: JSONType
-        inputs_expr_step = {} # type: JSONType
-        output_processing_step = {} # type: JSONType
+        workflow_expr_step = None # type: JSONType
+        workflow_expr_process_step = None # type: JSONType
+        runtime_expr_step = None # type: JSONType
+        inputs_expr_step = None # type: JSONType
+        output_processing_step = None # type: JSONType
 
         workflow_expr_new_valuesFrom = {}
         workflow_exprs = []
         for step_in in map_to_array(step["in"]):
             if isinstance(step_in, dict):
-
-                def on_found_workflow_expr(expression):
-                    workflow_exprs.append({"self": f"inputs.{step_in}", "expr": expression})
-                    return f"$(inputs.{OUTPUT_EXPR_SYMBOL}[{len(workflow_exprs) - 1}])"
-
                 if step_in.get("valueFrom") is not None:
+                    found_expr = False
+                    def on_found_workflow_expr(expression):
+                        nonlocal found_expr
+                        found_expr = True
+                        workflow_exprs.append({"self": f'{step_in["id"]}', "expr": expression})
+                        return f"inputs.{OUTPUT_EXPR_SYMBOL}[{len(workflow_exprs) - 1}]"
+
                     new_valueFrom = replace_expr(step_in["valueFrom"], on_found_workflow_expr)
+                    del get_cwl_map(get_cwl_map(new_workflow_cwl["steps"], step_id)["in"], step_in["id"])["valueFrom"]
 
-                    workflow_expr_new_valuesFrom[step_in["id"]] = new_valueFrom
+                    if found_expr:
+                        workflow_expr_new_valuesFrom[step_in["id"]] = new_valueFrom
 
-        if workflow_exprs != []:
-            if workflow_expression_lib == "":
-                workflow_expression_lib_dict_pair = []
+        if workflow_exprs is not None:
+            if workflow_expression_lib is None:
+                workflow_expression_lib_dict = {}
             else:
-                workflow_expression_lib_dict_pair = [("expressionLib", {"default": ";".join(workflow_expression_lib)})]
+                workflow_expression_lib_dict = {
+                    "expressionLib": {
+                        "default": ";".join(workflow_expression_lib)
+                    }
+                }
 
             workflow_expr_step = {
-                "id": "__process_workflow_exprs",
+                "id": EVAL_WORKFLOW_EXPRS,
                 "run": eval_exprs_location,
-                "in": update_dict(
-                    {
-                        "input_values": {
-                            "source": list(step["in"].keys())
-                        },
-                        "input_names": {
-                            "default": list(step["in"].keys())
-                        },
-                        "expressions": {
-                            "default": workflow_exprs
-                        }
+                "in": {
+                    "input_values": {
+                        "source": list(step["in"].keys())
                     },
-                    workflow_expression_lib_dict_pair
-                ),
+                    "input_names": {
+                        "default": list(step["in"].keys())
+                    },
+                    "expressions": {
+                        "default": workflow_exprs
+                    },
+                    **workflow_expression_lib_dict
+                },
                 "out": ["output"]
             }
 
-            workflow_expr_process_step = get_identity_workflow(
-                list(workflow_expr_new_valuesFrom.keys())
-            )
-
-            for key, new_valueFrom in workflow_expr_new_valuesFrom.items():
-                workflow_expr_process_step["requirements"] = {"StepInputExpressionRequirement": {}}
-                workflow_expr_process_step["inputs"][key]["valueFrom"] = new_valueFrom
+            workflow_expr_process_step = {
+                "id": PROCESS_WORKFLOW_EXPRS,
+                "in": {
+                    "__output_exprs": "__eval_workflow_exprs/output",
+                    **dict(list(map(
+                        lambda x: (
+                            x[0] + "_in",
+                            {"valueFrom": x[1]}
+                        ),
+                        workflow_expr_new_valuesFrom.items()
+                    )))
+                },
+                "run": get_identity_workflow(list(workflow_expr_new_valuesFrom.keys())),
+                "out": list(workflow_expr_new_valuesFrom.keys())
+            }
 
 
         if step_cwl["class"] == "CommandLineTool":
@@ -320,80 +343,80 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                     })
 
                 if js_req.get("expressionLib") is None:
-                    expression_lib_dict_pair = []
+                    expression_lib_dict = {} # type: JSONType
                 else:
-                    expression_lib_dict_pair = [("expressionLib", {"default": ";".join(js_req["expressionLib"])})]
+                    expression_lib_dict = {
+                        "expressionLib": {"default": ";".join(js_req["expressionLib"])}
+                    }
 
                 inputs_expr_step = {
-                    "id": "__eval_input_exprs",
+                    "id": EVAL_INPUT_EXPRS,
                     "run": eval_exprs_location,
-                    "in": update_dict(
-                        {
-                            "input_values": {
-                                "source": list(step["in"].keys())
-                            },
-                            "input_names": {
-                                "default": list(step["in"].keys())
-                            },
-                            "expressions": {
-                                "default": input_expressions
-                            }
+                    "in": {
+                        "input_values": {
+                            "source": list(step["in"].keys())
                         },
-                        expression_lib_dict_pair
-                    ),
+                        "input_names": {
+                            "default": list(step["in"].keys())
+                        },
+                        "expressions": {
+                            "default": input_expressions
+                        },
+                        **expression_lib_dict
+                    },
                     "out": ["output"]
                 }
 
-                if output_expressions == []:
+                if output_expressions != []:
                     output_processing_step = {
-                        "id": "__output_eval_exprs",
+                        "id": EVAL_OUTPUT_EXPRS,
                         "run": eval_exprs_location,
-                        "in": update_dict(
-                            {
-                                "input_values": {
-                                    "source": list(map(lambda x: step_id + "/" + x["outputId"], output_expressions))
-                                },
-                                "input_names": {
-                                    "default": list(map(lambda x: "__output_" + x["outputId"], output_expressions))
-                                },
-                                "expressions": {
-                                    "default": list(map(lambda x: {
-                                        "expr": x["expr"],
-                                        "self": "__output_" + x["outputId"]
-                                    }, output_expressions))
-                                }
+                        "in": {
+                            "input_values": {
+                                "source": list(map(lambda x: step_id + "/" + x["outputId"], output_expressions))
                             },
-                            expression_lib_dict_pair
-                        ),
+                            "input_names": {
+                                "default": list(map(lambda x: "__output_" + x["outputId"], output_expressions))
+                            },
+                            "expressions": {
+                                "default": list(map(lambda x: {
+                                    "expr": x["expr"],
+                                    "self": "__output_" + x["outputId"]
+                                }, output_expressions))
+                            },
+                            **expression_lib_dict
+                        },
                         "out": ["output"]
                     }
+            else:
+                write_new_cwl(step_run_location, step_cwl)
 
-
+            if any([workflow_expr_step, workflow_expr_process_step, runtime_expr_step, inputs_expr_step, output_processing_step]):
                 get_cwl_map(new_workflow_cwl["steps"], step_id, "id")["run"] = {
                     "class": "Workflow",
                     "inputs": dict(map(lambda input_name: (input_name, {
                         "type": "Any"
                     }), step["in"].keys())),
                     "outputs": dict(map(get_output_from_name, step["out"])),
-                    "steps": filter(None, [
+                    "steps": list(filter(None, [
                         workflow_expr_step,
                         workflow_expr_process_step,
                         runtime_expr_step,
                         inputs_expr_step,
                         {
-                            "id": step_id
-                            "in": update_dict(
-                                dict(zip(step["in"].keys(), step["in"].keys())),
-                                [(EXPR_SYMBOL, "__eval_exprs/output")]
-                            ),
+                            "id": step_id,
+                            "in": {
+                                **dict(zip(step["in"].keys(), step["in"].keys())),
+                                **dict(zip(workflow_expr_new_valuesFrom.keys(), map(lambda x: f"{PROCESS_WORKFLOW_EXPRS}/{x}", workflow_expr_new_valuesFrom.keys()))),
+                                EXPR_SYMBOL: f"{EVAL_INPUT_EXPRS}/output"
+                            },
                             "out": step["out"],
                             "run": step["run"]
                         },
                         output_processing_step
-                    ])
+                    ]))
                 }
-            else:
-                write_new_cwl(step_run_location, step_cwl)
+
         elif step_cwl["class"] == "Workflow":
             unjsify_workflow(step_run_location, outdir, base_cwldir)
         elif step_cwl["class"] == "ExpressionTool":

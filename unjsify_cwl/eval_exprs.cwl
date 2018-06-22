@@ -51,6 +51,10 @@ requirements:
             else
               expression.expr = expression.expr.slice(2, -1);
 
+            if(inputs[expression.self] === undefined){
+              throw Error("Invalid self value " + expression.self);
+            }
+
             return require("vm").runInNewContext(expressionLib + ";" + expression.expr, {
                 inputs: inputs,
                 self: expression.self == null?null:inputs[expression.self],
