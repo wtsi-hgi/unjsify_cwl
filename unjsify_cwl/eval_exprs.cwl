@@ -18,7 +18,7 @@ requirements:
           const fs = require("fs");
           const vm = require("vm");
 
-          const input_values = JSON.parse(fs.readFileSync("input_values.json"))["input_values"];
+          let input_values = JSON.parse(fs.readFileSync("input_values.json"))["input_values"];
           const input_names = JSON.parse(fs.readFileSync("input_names.json"))["input_names"];
           const expressions = JSON.parse(fs.readFileSync("expressions.json"))["expressions"];
           const expressionLib = fs.readFileSync("expressionLib.js");
