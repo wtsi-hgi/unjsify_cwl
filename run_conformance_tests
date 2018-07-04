@@ -1,0 +1,14 @@
+#!/bin/bash
+
+pushd "$( dirname "${BASH_SOURCE[0]}" )" > /dev/null || exit
+
+# Move required conformance test files to a location
+if [ ! -d "conformance_test_data" ]; then
+    mkdir conformance_test_data
+    ls -1 -d ../common-workflow-language/v1.0/v1.0/* | grep -v ".json\\|.cwl" | xargs -n1 -I {} cp -r {} conformance_test_data/
+fi
+
+# Run the conformance tests
+env PATH="$PATH":"$(pwd)" ../common-workflow-language/run_test.sh -n1 RUNNER="__conformance_test_runner"
+
+popd > /dev/null || exit

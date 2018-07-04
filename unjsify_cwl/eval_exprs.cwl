@@ -61,7 +61,6 @@ requirements:
                 runtime: undefined
             });
           })
-          console.log(new_expressions)
 
           fs.writeFileSync("cwl.output.json", JSON.stringify({
             output:new_expressions

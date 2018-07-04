@@ -171,6 +171,9 @@ def get_identity_workflow(steps_names):
         "steps": []
     }
 
+def steralize_name(name: str):
+    return name.replace("#", "")
+
 JSONType = Dict[str, Any]
 
 EVAL_WORKFLOW_EXPRS = "__eval_workflow_exprs"
@@ -202,10 +205,12 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
     workflow_cwl = get_cwl(workflow_location)
 
     if workflow_cwl["class"] != "Workflow":
+        inputs_ids = list(map(steralize_name, get_map_keys(workflow_cwl["inputs"], "id")))
+
         workflow_cwl = {
             "cwlVersion": "v1.0",
             "class": "Workflow",
-            "inputs": dict(zip(get_map_keys(workflow_cwl["inputs"], "id"), iterate(lambda: {"type": "Any?"}))),
+            "inputs": dict(zip(inputs_ids, iterate(lambda: {"type": "Any?"}))),
             "outputs": dict(map(lambda x: (x, {"outputSource": "cmdline_tool/" + x, "type": "Any?"}),
                 get_map_keys(workflow_cwl["outputs"], "id"))),
             "requirements": [{
@@ -214,7 +219,7 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
             "steps": [{
                 "id": "cmdline_tool",
                 "run": "__" + path.basename(workflow_location),
-                "in": dict(zip(get_map_keys(workflow_cwl["inputs"], "id"), get_map_keys(workflow_cwl["inputs"], "id"))),
+                "in": dict(zip(inputs_ids, inputs_ids)),
                 "out": list(get_map_keys(workflow_cwl["outputs"], "id"))
             }]
         }
@@ -272,11 +277,11 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                     new_valueFrom = replace_expr(step_in["valueFrom"], on_found_workflow_expr)
 
                     if found_expr:
-                        get_cwl_map(get_cwl_map(new_workflow_cwl["steps"], step_id)["in"], step_in["id"])["valueFrom"] = ""
+                        del get_cwl_map(get_cwl_map(new_workflow_cwl["steps"], step_id)["in"], step_in["id"])["valueFrom"]
 
                         workflow_expr_new_valuesFrom[step_in["id"]] = new_valueFrom
 
-        if workflow_exprs is not None:
+        if workflow_exprs != []:
             if workflow_expression_lib is None:
                 workflow_expression_lib_dict = {}
             else:
@@ -321,9 +326,15 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
             }
 
 
-        if step_cwl["class"] == "CommandLineTool":
+        if step_cwl["class"] in ("CommandLineTool", "ExpressionTool"):
             js_req = get_cwl_map(step_cwl.get("requirements", []), "InlineJavascriptRequirement", "class")
             data_by_outputId = {}
+
+            if step_cwl["class"] == "ExpressionTool":
+                step_cwl["class"] = "CommandLineTool"
+                step_cwl["arguments"] = ["bash", "-c", f'echo {step_cwl["expression"]} > cwl.output.json']
+
+                js_req = {}
 
             if js_req is not None:
                 input_expressions, output_expressions, data_by_outputId, new_tool = unjsify_tool(step_cwl)
@@ -389,7 +400,7 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                         "type": data_by_outputId[output_name]["type"]
                     })
                 return (output_name, {
-                    "type": "Any",
+                    "type": "Any?",
                     "outputSource": f'{step_id}/{output_name}'
                 })
 
@@ -397,7 +408,7 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                 get_cwl_map(new_workflow_cwl["steps"], step_id, "id")["run"] = {
                     "class": "Workflow",
                     "inputs": dict(map(lambda input_name: (input_name, {
-                        "type": "Any"
+                        "type": "Any?"
                     }), step["in"].keys())),
                     "outputs": dict(map(get_output_from_name, step["out"])),
                     "steps": list(filter(None, [
@@ -421,8 +432,8 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
 
         elif step_cwl["class"] == "Workflow":
             unjsify_workflow(step_run_location, outdir, base_cwldir)
-        elif step_cwl["class"] == "ExpressionTool":
-            write_new_cwl(step_run_location, step_cwl)
+        else:
+            raise Exception(f'Unknown step type {step_cwl["class"]}')
 
     write_new_cwl(workflow_location, new_workflow_cwl)
 
@@ -447,7 +458,7 @@ def replace_expr(node, on_found_expr):
         if unscanned_str[scan_slice[0]] == '$':
             expression = unscanned_str[scan_slice[0]:scan_slice[1]]
             if not is_parameter_reference(unscanned_str[scan_slice[0]+2:scan_slice[1]-1]):
-                value_arr[scan_slice[0]+2:scan_slice[1]-1] = list(on_found_expr(expression))
+                value_arr[scan_slice[0]:scan_slice[1]] = list("$(" + on_found_expr(expression) + ")")
 
         unscanned_str = unscanned_str[scan_slice[1]:]
         scan_slice = scan_expression(unscanned_str)
@@ -499,7 +510,7 @@ def unjsify_tool(cwl):
                     "type": output["type"]
                 }
                 del output["outputBinding"]["outputEval"]
-                output["type"] = "Any"
+                output["type"] = "Any?"
 
     def on_found_expr(expression):
         input_expressions.append({"self": None, "expr": expression})
@@ -518,7 +529,7 @@ def unjsify_tool(cwl):
         add_cwl_map(cwl["inputs"], EXPR_SYMBOL, "id", {
             "type": {
                 "type": "array",
-                "items": "Any"
+                "items": ["Any", "null"]
             }
         })
 
@@ -526,22 +537,14 @@ def unjsify_tool(cwl):
     return input_expressions, output_expressions, data_by_outputId, cwl
 
 def main():
-    parser = argparse.ArgumentParser("unjsify")
+    parser = argparse.ArgumentParser(__name__)
     parser.add_argument("cwl_workflow", help="Initial CWL workflow file to unjsify.")
     parser.add_argument("-b", "--base-dir", help="Base directory for the CWL files")
     parser.add_argument("-o", "--output", help="Output directory for results.")
-    parser.add_argument("--cwltool", help="Run cwltool with inputs specified.")
     args = parser.parse_args()
 
     if args.base_dir is None:
         args.base_dir = path.dirname(args.cwl_workflow)
-
-    if args.cwltool is not None:
-        with tempfile.TemporaryDirectory("unjsify") as tmpfolder:
-            unjsify(args.cwl_workflow, tmpfolder, args.base_dir)
-            os.system(f"cwltool {args.cwl_workflow} {args.cwltool}")
-
-        return
 
     unjsify(args.cwl_workflow, args.output, args.base_dir)
 
