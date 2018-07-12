@@ -2,6 +2,10 @@ cwlVersion: v1.0
 class: CommandLineTool
 doc: Evaluate a series of JavaScript expressions
 
+hints:
+  DockerRequirement:
+    dockerPull: node
+
 requirements:
   InitialWorkDirRequirement:
     listing:
@@ -71,8 +75,6 @@ requirements:
                 })
             });
           })
-
-          console.log(JSON.stringify({output:new_expressions}));
 
           fs.writeFileSync("cwl.output.json", JSON.stringify({
             output:new_expressions

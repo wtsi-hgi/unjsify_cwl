@@ -552,7 +552,7 @@ def _document_load(loader, doc, baseuri, loadingOptions):
 
     raise ValidationException()
 
-
+import sys
 def _document_load_by_url(loader, url, loadingOptions):
     if url in loadingOptions.idx:
         return _document_load(loader, loadingOptions.idx[url], url, loadingOptions)
