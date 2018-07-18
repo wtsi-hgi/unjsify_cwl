@@ -12,12 +12,17 @@ parser.add_argument("input")
 parser.add_argument("--outdir")
 parser.add_argument("--quiet", action='store_true')
 parser.add_argument("--transpiled-outdir")
+parser.add_argument("--unjsify-language")
 args = parser.parse_args()
 
 if args.transpiled_outdir is None:
     args.transpiled_outdir = tempfile.mkdtemp()
 
-unjsifycwl_cmdline = "unjsifycwl --output %s %s" % (args.transpiled_outdir, args.cwl)
+language_option = ""
+if args.unjsify_language is not None:
+    language_option = "--language " + args.unjsify_language
+
+unjsifycwl_cmdline = "unjsifycwl --output %s %s %s" % (args.transpiled_outdir, path.abspath(args.cwl), language_option)
 print(unjsifycwl_cmdline, file=sys.stderr)
 subprocess.check_call(unjsifycwl_cmdline, shell=True)
 
@@ -26,7 +31,7 @@ outdir_arg = ""
 if args.outdir is not None:
     outdir_arg = "--outdir " + args.outdir
 
-cwltool_cmdline = "cwltool --quiet %s %s %s" % (outdir_arg, args.transpiled_outdir + "/" + path.basename(args.cwl), args.input)
+cwltool_cmdline = "cwltool --quiet %s %s %s" % (outdir_arg, path.abspath(args.transpiled_outdir + "/" + path.basename(args.cwl)), path.abspath(args.input))
 
 print(cwltool_cmdline, file=sys.stderr)
 subprocess.check_call(cwltool_cmdline, shell=True)

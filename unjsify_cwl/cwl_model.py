@@ -195,6 +195,7 @@ import ruamel.yaml as yaml
 import copy
 import re
 from typing import List, Text, Dict, Union, Any, Sequence
+import uuid
 
 class ValidationException(Exception):
     pass
@@ -203,13 +204,17 @@ class Savable(object):
     pass
 
 class LoadingOptions(object):
-    def __init__(self, fetcher=None, namespaces=None, fileuri=None, copyfrom=None):
+    def __init__(self, fetcher=None, namespaces=None, fileuri=None, copyfrom=None, schemas=None):
         if copyfrom is not None:
             self.idx = copyfrom.idx
             if fetcher is None:
                 fetcher = copyfrom.fetcher
             if fileuri is None:
                 fileuri = copyfrom.fileuri
+            if namespaces is None:
+                namespaces = copyfrom.namespaces
+            if namespaces is None:
+                schemas = copyfrom.schemas
         else:
             self.idx = {}
 
@@ -239,6 +244,8 @@ class LoadingOptions(object):
 
         self.vocab = _vocab
         self.rvocab = _rvocab
+        self.namespaces = namespaces
+        self.schemas = schemas
 
         if namespaces is not None:
             self.vocab = self.vocab.copy()
@@ -246,6 +253,8 @@ class LoadingOptions(object):
             for k,v in six.iteritems(namespaces):
                 self.vocab[k] = v
                 self.rvocab[v] = k
+
+
 
 def load_field(val, fieldtype, baseuri, loadingOptions):
     if isinstance(val, dict):
@@ -256,11 +265,11 @@ def load_field(val, fieldtype, baseuri, loadingOptions):
     return fieldtype.load(val, baseuri, loadingOptions)
 
 
-def save(val):
+def save(val, top=True, base_url=""):
     if isinstance(val, Savable):
-        return val.save()
+        return val.save(top=top, base_url=base_url)
     if isinstance(val, list):
-        return [save(v) for v in val]
+        return [save(v, top=False, base_url=base_url) for v in val]
     return val
 
 def expand_url(url,                 # type: Union[str, Text]
@@ -524,6 +533,11 @@ def _document_load(loader, doc, baseuri, loadingOptions):
     if isinstance(doc, dict):
         if "$namespaces" in doc:
             loadingOptions = LoadingOptions(copyfrom=loadingOptions, namespaces=doc["$namespaces"])
+            doc = {k: v for k,v in doc.items() if k != "$namespaces"}
+
+        if "$schemas" in doc:
+            loadingOptions = LoadingOptions(copyfrom=loadingOptions, schemas=doc["$schemas"])
+            doc = {k: v for k,v in doc.items() if k != "$schemas"}
 
         if "$base" in doc:
             baseuri = doc["$base"]
@@ -573,6 +587,31 @@ def file_uri(path, split_frag=False):  # type: (str, bool) -> str
     else:
         return "file://%s%s" % (urlpath, frag)
 
+def prefix_url(url, namespaces):
+    for k,v in namespaces.items():
+        if url.startswith(v):
+            return k+":"+url[len(v):]
+    return url
+
+def save_relative_uri(uri, base_url, scoped_id):
+    if isinstance(uri, list):
+        return [save_relative_uri(u, base_url, scoped_id) for u in uri]
+    elif isinstance(uri, str):
+        urisplit = urllib.parse.urlsplit(uri)
+        basesplit = urllib.parse.urlsplit(base_url)
+        if urisplit.scheme == basesplit.scheme and urisplit.netloc == basesplit.netloc:
+            if urisplit.path == basesplit.path:
+                p = ""
+            else:
+                p = os.path.relpath(urisplit.path, os.path.dirname(basesplit.path))
+
+            if urisplit.fragment:
+                p = p + "#" + urisplit.fragment
+            return p
+        return uri
+    else:
+        return save(uri, top=False, base_url=base_url)
+
 
 class RecordField(Savable):
     """
@@ -584,7 +623,7 @@ A field of a record.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'name' in doc:
             try:
                 self.name = load_field(doc.get('name'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -614,25 +653,39 @@ A field of a record.
             errors.append(SourceLine(doc, 'type', str).makeError("the `type` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'RecordField'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.name is not None:
-            r['name'] = save(self.name)
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['name', 'doc', 'type'])
+    attrs = frozenset([u'name', u'doc', u'type'])
 
 
 class RecordSchema(Savable):
@@ -642,7 +695,7 @@ class RecordSchema(Savable):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'fields' in doc:
             try:
                 self.fields = load_field(doc.get('fields'), idmap_fields_union_of_None_type_or_array_of_RecordFieldLoader, baseuri, loadingOptions)
@@ -657,23 +710,36 @@ class RecordSchema(Savable):
             errors.append(SourceLine(doc, 'type', str).makeError("the `type` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'RecordSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.fields is not None:
-            r['fields'] = save(self.fields)
+            r['fields'] = save(self.fields, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['fields', 'type'])
+    attrs = frozenset([u'fields', u'type'])
 
 
 class EnumSchema(Savable):
@@ -687,7 +753,7 @@ Define an enumerated type.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.symbols = load_field(doc.get('symbols'), uri_array_of_strtype_True_False_None, baseuri, loadingOptions)
         except ValidationException as e:
@@ -699,23 +765,36 @@ Define an enumerated type.
             errors.append(SourceLine(doc, 'type', str).makeError("the `type` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'EnumSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.symbols is not None:
-            r['symbols'] = save(self.symbols)
+            r['symbols'] = save_relative_uri(self.symbols, base_url, True)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['symbols', 'type'])
+    attrs = frozenset([u'symbols', u'type'])
 
 
 class ArraySchema(Savable):
@@ -725,7 +804,7 @@ class ArraySchema(Savable):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.items = load_field(doc.get('items'), uri_union_of_PrimitiveTypeLoader_or_RecordSchemaLoader_or_EnumSchemaLoader_or_ArraySchemaLoader_or_strtype_or_array_of_union_of_PrimitiveTypeLoader_or_RecordSchemaLoader_or_EnumSchemaLoader_or_ArraySchemaLoader_or_strtype_False_True_2, baseuri, loadingOptions)
         except ValidationException as e:
@@ -737,23 +816,36 @@ class ArraySchema(Savable):
             errors.append(SourceLine(doc, 'type', str).makeError("the `type` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'ArraySchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.items is not None:
-            r['items'] = save(self.items)
+            r['items'] = save_relative_uri(self.items, base_url, False)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['items', 'type'])
+    attrs = frozenset([u'items', u'type'])
 
 
 class File(Savable):
@@ -832,11 +924,10 @@ the same value for `location`.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_File_classLoader_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'File':
+            raise ValidationException("Not a File")
 
         if 'location' in doc:
             try:
@@ -927,43 +1018,65 @@ the same value for `location`.
             self.contents = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `location`, `path`, `basename`, `dirname`, `nameroot`, `nameext`, `checksum`, `size`, `secondaryFiles`, `format`, `contents`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `location`, `path`, `basename`, `dirname`, `nameroot`, `nameext`, `checksum`, `size`, `secondaryFiles`, `format`, `contents`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'File'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'File'
+
         if self.location is not None:
-            r['location'] = save(self.location)
+            r['location'] = save_relative_uri(self.location, base_url, False)
+
         if self.path is not None:
-            r['path'] = save(self.path)
+            r['path'] = save_relative_uri(self.path, base_url, False)
+
         if self.basename is not None:
-            r['basename'] = save(self.basename)
+            r['basename'] = save(self.basename, top=False, base_url=base_url)
+
         if self.dirname is not None:
-            r['dirname'] = save(self.dirname)
+            r['dirname'] = save(self.dirname, top=False, base_url=base_url)
+
         if self.nameroot is not None:
-            r['nameroot'] = save(self.nameroot)
+            r['nameroot'] = save(self.nameroot, top=False, base_url=base_url)
+
         if self.nameext is not None:
-            r['nameext'] = save(self.nameext)
+            r['nameext'] = save(self.nameext, top=False, base_url=base_url)
+
         if self.checksum is not None:
-            r['checksum'] = save(self.checksum)
+            r['checksum'] = save(self.checksum, top=False, base_url=base_url)
+
         if self.size is not None:
-            r['size'] = save(self.size)
+            r['size'] = save(self.size, top=False, base_url=base_url)
+
         if self.secondaryFiles is not None:
-            r['secondaryFiles'] = save(self.secondaryFiles)
+            r['secondaryFiles'] = save(self.secondaryFiles, top=False, base_url=base_url)
+
         if self.format is not None:
-            r['format'] = save(self.format)
+            r['format'] = save_relative_uri(self.format, base_url, True)
+
         if self.contents is not None:
-            r['contents'] = save(self.contents)
+            r['contents'] = save(self.contents, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'location', 'path', 'basename', 'dirname', 'nameroot', 'nameext', 'checksum', 'size', 'secondaryFiles', 'format', 'contents'])
+    attrs = frozenset([u'class', u'location', u'path', u'basename', u'dirname', u'nameroot', u'nameext', u'checksum', u'size', u'secondaryFiles', u'format', u'contents'])
 
 
 class Directory(Savable):
@@ -1019,11 +1132,10 @@ or in any entry in `secondaryFiles` in the listing) is a fatal error.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_Directory_classLoader_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'Directory':
+            raise ValidationException("Not a Directory")
 
         if 'location' in doc:
             try:
@@ -1058,29 +1170,44 @@ or in any entry in `secondaryFiles` in the listing) is a fatal error.
             self.listing = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `location`, `path`, `basename`, `listing`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `location`, `path`, `basename`, `listing`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'Directory'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'Directory'
+
         if self.location is not None:
-            r['location'] = save(self.location)
+            r['location'] = save_relative_uri(self.location, base_url, False)
+
         if self.path is not None:
-            r['path'] = save(self.path)
+            r['path'] = save_relative_uri(self.path, base_url, False)
+
         if self.basename is not None:
-            r['basename'] = save(self.basename)
+            r['basename'] = save(self.basename, top=False, base_url=base_url)
+
         if self.listing is not None:
-            r['listing'] = save(self.listing)
+            r['listing'] = save(self.listing, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'location', 'path', 'basename', 'listing'])
+    attrs = frozenset([u'class', u'location', u'path', u'basename', u'listing'])
 
 
 class SchemaBase(Savable):
@@ -1112,7 +1239,7 @@ class InputRecordField(RecordField):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'name' in doc:
             try:
                 self.name = load_field(doc.get('name'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -1158,29 +1285,45 @@ class InputRecordField(RecordField):
             self.label = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`, `inputBinding`, `label`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`, `inputBinding`, `label`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'InputRecordField'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.name is not None:
-            r['name'] = save(self.name)
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.inputBinding is not None:
-            r['inputBinding'] = save(self.inputBinding)
+            r['inputBinding'] = save(self.inputBinding, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['name', 'doc', 'type', 'inputBinding', 'label'])
+    attrs = frozenset([u'name', u'doc', u'type', u'inputBinding', u'label'])
 
 
 class InputRecordSchema(RecordSchema, InputSchema):
@@ -1190,7 +1333,22 @@ class InputRecordSchema(RecordSchema, InputSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
+        if 'name' in doc:
+            try:
+                self.name = load_field(doc.get('name'), uri_union_of_None_type_or_strtype_True_False_None, baseuri, loadingOptions)
+            except ValidationException as e:
+                errors.append(SourceLine(doc, 'name', str).makeError("the `name` field is not valid because:\n"+str(e)))
+        else:
+            self.name = None
+
+
+        if self.name is None:
+            if docRoot is not None:
+                self.name = docRoot
+            else:
+                self.name = "_:" + str(uuid.uuid4())
+        baseuri = self.name
         if 'fields' in doc:
             try:
                 self.fields = load_field(doc.get('fields'), idmap_fields_union_of_None_type_or_array_of_InputRecordFieldLoader, baseuri, loadingOptions)
@@ -1213,25 +1371,42 @@ class InputRecordSchema(RecordSchema, InputSchema):
             self.label = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`, `label`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`, `label`, `name`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'InputRecordSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        if self.name is not None:
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.fields is not None:
-            r['fields'] = save(self.fields)
+            r['fields'] = save(self.fields, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['fields', 'type', 'label'])
+    attrs = frozenset([u'fields', u'type', u'label', u'name'])
 
 
 class InputEnumSchema(EnumSchema, InputSchema):
@@ -1241,7 +1416,22 @@ class InputEnumSchema(EnumSchema, InputSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
+        if 'name' in doc:
+            try:
+                self.name = load_field(doc.get('name'), uri_union_of_None_type_or_strtype_True_False_None, baseuri, loadingOptions)
+            except ValidationException as e:
+                errors.append(SourceLine(doc, 'name', str).makeError("the `name` field is not valid because:\n"+str(e)))
+        else:
+            self.name = None
+
+
+        if self.name is None:
+            if docRoot is not None:
+                self.name = docRoot
+            else:
+                self.name = "_:" + str(uuid.uuid4())
+        baseuri = self.name
         try:
             self.symbols = load_field(doc.get('symbols'), uri_array_of_strtype_True_False_None, baseuri, loadingOptions)
         except ValidationException as e:
@@ -1269,27 +1459,45 @@ class InputEnumSchema(EnumSchema, InputSchema):
             self.inputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`, `label`, `inputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`, `label`, `name`, `inputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'InputEnumSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        if self.name is not None:
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.symbols is not None:
-            r['symbols'] = save(self.symbols)
+            r['symbols'] = save_relative_uri(self.symbols, base_url, True)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.inputBinding is not None:
-            r['inputBinding'] = save(self.inputBinding)
+            r['inputBinding'] = save(self.inputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['symbols', 'type', 'label', 'inputBinding'])
+    attrs = frozenset([u'symbols', u'type', u'label', u'name', u'inputBinding'])
 
 
 class InputArraySchema(ArraySchema, InputSchema):
@@ -1299,7 +1507,7 @@ class InputArraySchema(ArraySchema, InputSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.items = load_field(doc.get('items'), uri_union_of_CWLTypeLoader_or_InputRecordSchemaLoader_or_InputEnumSchemaLoader_or_InputArraySchemaLoader_or_strtype_or_array_of_union_of_CWLTypeLoader_or_InputRecordSchemaLoader_or_InputEnumSchemaLoader_or_InputArraySchemaLoader_or_strtype_False_True_2, baseuri, loadingOptions)
         except ValidationException as e:
@@ -1327,27 +1535,42 @@ class InputArraySchema(ArraySchema, InputSchema):
             self.inputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`, `label`, `inputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`, `label`, `inputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'InputArraySchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.items is not None:
-            r['items'] = save(self.items)
+            r['items'] = save_relative_uri(self.items, base_url, False)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.inputBinding is not None:
-            r['inputBinding'] = save(self.inputBinding)
+            r['inputBinding'] = save(self.inputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['items', 'type', 'label', 'inputBinding'])
+    attrs = frozenset([u'items', u'type', u'label', u'inputBinding'])
 
 
 class OutputRecordField(RecordField):
@@ -1357,7 +1580,7 @@ class OutputRecordField(RecordField):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'name' in doc:
             try:
                 self.name = load_field(doc.get('name'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -1395,27 +1618,42 @@ class OutputRecordField(RecordField):
             self.outputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`, `outputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`, `outputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'OutputRecordField'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.name is not None:
-            r['name'] = save(self.name)
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['name', 'doc', 'type', 'outputBinding'])
+    attrs = frozenset([u'name', u'doc', u'type', u'outputBinding'])
 
 
 class OutputRecordSchema(RecordSchema, OutputSchema):
@@ -1425,7 +1663,7 @@ class OutputRecordSchema(RecordSchema, OutputSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'fields' in doc:
             try:
                 self.fields = load_field(doc.get('fields'), idmap_fields_union_of_None_type_or_array_of_OutputRecordFieldLoader, baseuri, loadingOptions)
@@ -1448,25 +1686,39 @@ class OutputRecordSchema(RecordSchema, OutputSchema):
             self.label = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`, `label`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`, `label`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'OutputRecordSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.fields is not None:
-            r['fields'] = save(self.fields)
+            r['fields'] = save(self.fields, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['fields', 'type', 'label'])
+    attrs = frozenset([u'fields', u'type', u'label'])
 
 
 class OutputEnumSchema(EnumSchema, OutputSchema):
@@ -1476,7 +1728,7 @@ class OutputEnumSchema(EnumSchema, OutputSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.symbols = load_field(doc.get('symbols'), uri_array_of_strtype_True_False_None, baseuri, loadingOptions)
         except ValidationException as e:
@@ -1504,27 +1756,42 @@ class OutputEnumSchema(EnumSchema, OutputSchema):
             self.outputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`, `label`, `outputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`, `label`, `outputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'OutputEnumSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.symbols is not None:
-            r['symbols'] = save(self.symbols)
+            r['symbols'] = save_relative_uri(self.symbols, base_url, True)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['symbols', 'type', 'label', 'outputBinding'])
+    attrs = frozenset([u'symbols', u'type', u'label', u'outputBinding'])
 
 
 class OutputArraySchema(ArraySchema, OutputSchema):
@@ -1534,7 +1801,7 @@ class OutputArraySchema(ArraySchema, OutputSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.items = load_field(doc.get('items'), uri_union_of_CWLTypeLoader_or_OutputRecordSchemaLoader_or_OutputEnumSchemaLoader_or_OutputArraySchemaLoader_or_strtype_or_array_of_union_of_CWLTypeLoader_or_OutputRecordSchemaLoader_or_OutputEnumSchemaLoader_or_OutputArraySchemaLoader_or_strtype_False_True_2, baseuri, loadingOptions)
         except ValidationException as e:
@@ -1562,27 +1829,42 @@ class OutputArraySchema(ArraySchema, OutputSchema):
             self.outputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`, `label`, `outputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`, `label`, `outputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'OutputArraySchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.items is not None:
-            r['items'] = save(self.items)
+            r['items'] = save_relative_uri(self.items, base_url, False)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['items', 'type', 'label', 'outputBinding'])
+    attrs = frozenset([u'items', u'type', u'label', u'outputBinding'])
 
 
 class InputParameter(Parameter):
@@ -1592,7 +1874,7 @@ class InputParameter(Parameter):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -1673,37 +1955,57 @@ class InputParameter(Parameter):
             self.type = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `format`, `inputBinding`, `default`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `format`, `inputBinding`, `default`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'InputParameter'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.secondaryFiles is not None:
-            r['secondaryFiles'] = save(self.secondaryFiles)
+            r['secondaryFiles'] = save(self.secondaryFiles, top=False, base_url=base_url)
+
         if self.streamable is not None:
-            r['streamable'] = save(self.streamable)
+            r['streamable'] = save(self.streamable, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.format is not None:
-            r['format'] = save(self.format)
+            r['format'] = save_relative_uri(self.format, base_url, True)
+
         if self.inputBinding is not None:
-            r['inputBinding'] = save(self.inputBinding)
+            r['inputBinding'] = save(self.inputBinding, top=False, base_url=base_url)
+
         if self.default is not None:
-            r['default'] = save(self.default)
+            r['default'] = save(self.default, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['label', 'secondaryFiles', 'streamable', 'doc', 'id', 'format', 'inputBinding', 'default', 'type'])
+    attrs = frozenset([u'label', u'secondaryFiles', u'streamable', u'doc', u'id', u'format', u'inputBinding', u'default', u'type'])
 
 
 class OutputParameter(Parameter):
@@ -1713,7 +2015,7 @@ class OutputParameter(Parameter):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -1778,33 +2080,51 @@ class OutputParameter(Parameter):
             self.format = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `outputBinding`, `format`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `outputBinding`, `format`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'OutputParameter'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.secondaryFiles is not None:
-            r['secondaryFiles'] = save(self.secondaryFiles)
+            r['secondaryFiles'] = save(self.secondaryFiles, top=False, base_url=base_url)
+
         if self.streamable is not None:
-            r['streamable'] = save(self.streamable)
+            r['streamable'] = save(self.streamable, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
         if self.format is not None:
-            r['format'] = save(self.format)
+            r['format'] = save_relative_uri(self.format, base_url, True)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['label', 'secondaryFiles', 'streamable', 'doc', 'id', 'outputBinding', 'format'])
+    attrs = frozenset([u'label', u'secondaryFiles', u'streamable', u'doc', u'id', u'outputBinding', u'format'])
 
 
 class ProcessRequirement(Savable):
@@ -1842,11 +2162,10 @@ interpolatation.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'InlineJavascriptRequirement':
+            raise ValidationException("Not a InlineJavascriptRequirement")
 
         if 'expressionLib' in doc:
             try:
@@ -1857,23 +2176,35 @@ interpolatation.
             self.expressionLib = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `expressionLib`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `expressionLib`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'InlineJavascriptRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'InlineJavascriptRequirement'
+
         if self.expressionLib is not None:
-            r['expressionLib'] = save(self.expressionLib)
+            r['expressionLib'] = save(self.expressionLib, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'expressionLib'])
+    attrs = frozenset([u'class', u'expressionLib'])
 
 
 class SchemaDefRequirement(ProcessRequirement):
@@ -1893,11 +2224,10 @@ to earlier schema definitions.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'SchemaDefRequirement':
+            raise ValidationException("Not a SchemaDefRequirement")
 
         try:
             self.types = load_field(doc.get('types'), array_of_union_of_InputRecordSchemaLoader_or_InputEnumSchemaLoader_or_InputArraySchemaLoader, baseuri, loadingOptions)
@@ -1905,23 +2235,35 @@ to earlier schema definitions.
             errors.append(SourceLine(doc, 'types', str).makeError("the `types` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `types`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `types`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'SchemaDefRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'SchemaDefRequirement'
+
         if self.types is not None:
-            r['types'] = save(self.types)
+            r['types'] = save(self.types, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'types'])
+    attrs = frozenset([u'class', u'types'])
 
 
 class EnvironmentDef(Savable):
@@ -1937,7 +2279,7 @@ result of executing an expression, such as getting a parameter from input.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.envName = load_field(doc.get('envName'), strtype, baseuri, loadingOptions)
         except ValidationException as e:
@@ -1949,23 +2291,36 @@ result of executing an expression, such as getting a parameter from input.
             errors.append(SourceLine(doc, 'envValue', str).makeError("the `envValue` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `envName`, `envValue`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `envName`, `envValue`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'EnvironmentDef'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.envName is not None:
-            r['envName'] = save(self.envName)
+            r['envName'] = save(self.envName, top=False, base_url=base_url)
+
         if self.envValue is not None:
-            r['envValue'] = save(self.envValue)
+            r['envValue'] = save(self.envValue, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['envName', 'envValue'])
+    attrs = frozenset([u'envName', u'envValue'])
 
 
 class CommandLineBinding(InputBinding):
@@ -2009,7 +2364,7 @@ effective value.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'loadContents' in doc:
             try:
                 self.loadContents = load_field(doc.get('loadContents'), union_of_None_type_or_booltype, baseuri, loadingOptions)
@@ -2067,33 +2422,51 @@ effective value.
             self.shellQuote = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `loadContents`, `position`, `prefix`, `separate`, `itemSeparator`, `valueFrom`, `shellQuote`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `loadContents`, `position`, `prefix`, `separate`, `itemSeparator`, `valueFrom`, `shellQuote`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandLineBinding'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.loadContents is not None:
-            r['loadContents'] = save(self.loadContents)
+            r['loadContents'] = save(self.loadContents, top=False, base_url=base_url)
+
         if self.position is not None:
-            r['position'] = save(self.position)
+            r['position'] = save(self.position, top=False, base_url=base_url)
+
         if self.prefix is not None:
-            r['prefix'] = save(self.prefix)
+            r['prefix'] = save(self.prefix, top=False, base_url=base_url)
+
         if self.separate is not None:
-            r['separate'] = save(self.separate)
+            r['separate'] = save(self.separate, top=False, base_url=base_url)
+
         if self.itemSeparator is not None:
-            r['itemSeparator'] = save(self.itemSeparator)
+            r['itemSeparator'] = save(self.itemSeparator, top=False, base_url=base_url)
+
         if self.valueFrom is not None:
-            r['valueFrom'] = save(self.valueFrom)
+            r['valueFrom'] = save(self.valueFrom, top=False, base_url=base_url)
+
         if self.shellQuote is not None:
-            r['shellQuote'] = save(self.shellQuote)
+            r['shellQuote'] = save(self.shellQuote, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['loadContents', 'position', 'prefix', 'separate', 'itemSeparator', 'valueFrom', 'shellQuote'])
+    attrs = frozenset([u'loadContents', u'position', u'prefix', u'separate', u'itemSeparator', u'valueFrom', u'shellQuote'])
 
 
 class CommandOutputBinding(OutputBinding):
@@ -2116,7 +2489,7 @@ following order:
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'glob' in doc:
             try:
                 self.glob = load_field(doc.get('glob'), union_of_None_type_or_strtype_or_ExpressionLoader_or_array_of_strtype, baseuri, loadingOptions)
@@ -2142,25 +2515,39 @@ following order:
             self.outputEval = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `glob`, `loadContents`, `outputEval`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `glob`, `loadContents`, `outputEval`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandOutputBinding'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.glob is not None:
-            r['glob'] = save(self.glob)
+            r['glob'] = save(self.glob, top=False, base_url=base_url)
+
         if self.loadContents is not None:
-            r['loadContents'] = save(self.loadContents)
+            r['loadContents'] = save(self.loadContents, top=False, base_url=base_url)
+
         if self.outputEval is not None:
-            r['outputEval'] = save(self.outputEval)
+            r['outputEval'] = save(self.outputEval, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['glob', 'loadContents', 'outputEval'])
+    attrs = frozenset([u'glob', u'loadContents', u'outputEval'])
 
 
 class CommandInputRecordField(InputRecordField):
@@ -2170,7 +2557,7 @@ class CommandInputRecordField(InputRecordField):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'name' in doc:
             try:
                 self.name = load_field(doc.get('name'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -2216,29 +2603,45 @@ class CommandInputRecordField(InputRecordField):
             self.label = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`, `inputBinding`, `label`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`, `inputBinding`, `label`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandInputRecordField'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.name is not None:
-            r['name'] = save(self.name)
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.inputBinding is not None:
-            r['inputBinding'] = save(self.inputBinding)
+            r['inputBinding'] = save(self.inputBinding, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['name', 'doc', 'type', 'inputBinding', 'label'])
+    attrs = frozenset([u'name', u'doc', u'type', u'inputBinding', u'label'])
 
 
 class CommandInputRecordSchema(InputRecordSchema):
@@ -2248,7 +2651,22 @@ class CommandInputRecordSchema(InputRecordSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
+        if 'name' in doc:
+            try:
+                self.name = load_field(doc.get('name'), uri_union_of_None_type_or_strtype_True_False_None, baseuri, loadingOptions)
+            except ValidationException as e:
+                errors.append(SourceLine(doc, 'name', str).makeError("the `name` field is not valid because:\n"+str(e)))
+        else:
+            self.name = None
+
+
+        if self.name is None:
+            if docRoot is not None:
+                self.name = docRoot
+            else:
+                self.name = "_:" + str(uuid.uuid4())
+        baseuri = self.name
         if 'fields' in doc:
             try:
                 self.fields = load_field(doc.get('fields'), idmap_fields_union_of_None_type_or_array_of_CommandInputRecordFieldLoader, baseuri, loadingOptions)
@@ -2271,25 +2689,42 @@ class CommandInputRecordSchema(InputRecordSchema):
             self.label = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`, `label`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`, `label`, `name`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandInputRecordSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        if self.name is not None:
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.fields is not None:
-            r['fields'] = save(self.fields)
+            r['fields'] = save(self.fields, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['fields', 'type', 'label'])
+    attrs = frozenset([u'fields', u'type', u'label', u'name'])
 
 
 class CommandInputEnumSchema(InputEnumSchema):
@@ -2299,7 +2734,22 @@ class CommandInputEnumSchema(InputEnumSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
+        if 'name' in doc:
+            try:
+                self.name = load_field(doc.get('name'), uri_union_of_None_type_or_strtype_True_False_None, baseuri, loadingOptions)
+            except ValidationException as e:
+                errors.append(SourceLine(doc, 'name', str).makeError("the `name` field is not valid because:\n"+str(e)))
+        else:
+            self.name = None
+
+
+        if self.name is None:
+            if docRoot is not None:
+                self.name = docRoot
+            else:
+                self.name = "_:" + str(uuid.uuid4())
+        baseuri = self.name
         try:
             self.symbols = load_field(doc.get('symbols'), uri_array_of_strtype_True_False_None, baseuri, loadingOptions)
         except ValidationException as e:
@@ -2327,27 +2777,45 @@ class CommandInputEnumSchema(InputEnumSchema):
             self.inputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`, `label`, `inputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`, `label`, `name`, `inputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandInputEnumSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        if self.name is not None:
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.symbols is not None:
-            r['symbols'] = save(self.symbols)
+            r['symbols'] = save_relative_uri(self.symbols, base_url, True)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.inputBinding is not None:
-            r['inputBinding'] = save(self.inputBinding)
+            r['inputBinding'] = save(self.inputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['symbols', 'type', 'label', 'inputBinding'])
+    attrs = frozenset([u'symbols', u'type', u'label', u'name', u'inputBinding'])
 
 
 class CommandInputArraySchema(InputArraySchema):
@@ -2357,7 +2825,7 @@ class CommandInputArraySchema(InputArraySchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.items = load_field(doc.get('items'), uri_union_of_CWLTypeLoader_or_CommandInputRecordSchemaLoader_or_CommandInputEnumSchemaLoader_or_CommandInputArraySchemaLoader_or_strtype_or_array_of_union_of_CWLTypeLoader_or_CommandInputRecordSchemaLoader_or_CommandInputEnumSchemaLoader_or_CommandInputArraySchemaLoader_or_strtype_False_True_2, baseuri, loadingOptions)
         except ValidationException as e:
@@ -2385,27 +2853,42 @@ class CommandInputArraySchema(InputArraySchema):
             self.inputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`, `label`, `inputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`, `label`, `inputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandInputArraySchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.items is not None:
-            r['items'] = save(self.items)
+            r['items'] = save_relative_uri(self.items, base_url, False)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.inputBinding is not None:
-            r['inputBinding'] = save(self.inputBinding)
+            r['inputBinding'] = save(self.inputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['items', 'type', 'label', 'inputBinding'])
+    attrs = frozenset([u'items', u'type', u'label', u'inputBinding'])
 
 
 class CommandOutputRecordField(OutputRecordField):
@@ -2415,7 +2898,7 @@ class CommandOutputRecordField(OutputRecordField):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'name' in doc:
             try:
                 self.name = load_field(doc.get('name'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -2453,27 +2936,42 @@ class CommandOutputRecordField(OutputRecordField):
             self.outputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`, `outputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `name`, `doc`, `type`, `outputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandOutputRecordField'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.name is not None:
-            r['name'] = save(self.name)
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['name', 'doc', 'type', 'outputBinding'])
+    attrs = frozenset([u'name', u'doc', u'type', u'outputBinding'])
 
 
 class CommandOutputRecordSchema(OutputRecordSchema):
@@ -2483,7 +2981,22 @@ class CommandOutputRecordSchema(OutputRecordSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
+        if 'name' in doc:
+            try:
+                self.name = load_field(doc.get('name'), uri_union_of_None_type_or_strtype_True_False_None, baseuri, loadingOptions)
+            except ValidationException as e:
+                errors.append(SourceLine(doc, 'name', str).makeError("the `name` field is not valid because:\n"+str(e)))
+        else:
+            self.name = None
+
+
+        if self.name is None:
+            if docRoot is not None:
+                self.name = docRoot
+            else:
+                self.name = "_:" + str(uuid.uuid4())
+        baseuri = self.name
         if 'fields' in doc:
             try:
                 self.fields = load_field(doc.get('fields'), idmap_fields_union_of_None_type_or_array_of_CommandOutputRecordFieldLoader, baseuri, loadingOptions)
@@ -2506,25 +3019,42 @@ class CommandOutputRecordSchema(OutputRecordSchema):
             self.label = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`, `label`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `fields`, `type`, `label`, `name`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandOutputRecordSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        if self.name is not None:
+            r['name'] = save_relative_uri(self.name, base_url, True)
+
         if self.fields is not None:
-            r['fields'] = save(self.fields)
+            r['fields'] = save(self.fields, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['fields', 'type', 'label'])
+    attrs = frozenset([u'fields', u'type', u'label', u'name'])
 
 
 class CommandOutputEnumSchema(OutputEnumSchema):
@@ -2534,7 +3064,7 @@ class CommandOutputEnumSchema(OutputEnumSchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.symbols = load_field(doc.get('symbols'), uri_array_of_strtype_True_False_None, baseuri, loadingOptions)
         except ValidationException as e:
@@ -2562,27 +3092,42 @@ class CommandOutputEnumSchema(OutputEnumSchema):
             self.outputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`, `label`, `outputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `symbols`, `type`, `label`, `outputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandOutputEnumSchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.symbols is not None:
-            r['symbols'] = save(self.symbols)
+            r['symbols'] = save_relative_uri(self.symbols, base_url, True)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['symbols', 'type', 'label', 'outputBinding'])
+    attrs = frozenset([u'symbols', u'type', u'label', u'outputBinding'])
 
 
 class CommandOutputArraySchema(OutputArraySchema):
@@ -2592,7 +3137,7 @@ class CommandOutputArraySchema(OutputArraySchema):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.items = load_field(doc.get('items'), uri_union_of_CWLTypeLoader_or_CommandOutputRecordSchemaLoader_or_CommandOutputEnumSchemaLoader_or_CommandOutputArraySchemaLoader_or_strtype_or_array_of_union_of_CWLTypeLoader_or_CommandOutputRecordSchemaLoader_or_CommandOutputEnumSchemaLoader_or_CommandOutputArraySchemaLoader_or_strtype_False_True_2, baseuri, loadingOptions)
         except ValidationException as e:
@@ -2620,27 +3165,42 @@ class CommandOutputArraySchema(OutputArraySchema):
             self.outputBinding = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`, `label`, `outputBinding`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `items`, `type`, `label`, `outputBinding`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandOutputArraySchema'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.items is not None:
-            r['items'] = save(self.items)
+            r['items'] = save_relative_uri(self.items, base_url, False)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['items', 'type', 'label', 'outputBinding'])
+    attrs = frozenset([u'items', u'type', u'label', u'outputBinding'])
 
 
 class CommandInputParameter(InputParameter):
@@ -2653,7 +3213,7 @@ An input parameter for a CommandLineTool.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -2734,37 +3294,57 @@ An input parameter for a CommandLineTool.
             self.type = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `format`, `inputBinding`, `default`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `format`, `inputBinding`, `default`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandInputParameter'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.secondaryFiles is not None:
-            r['secondaryFiles'] = save(self.secondaryFiles)
+            r['secondaryFiles'] = save(self.secondaryFiles, top=False, base_url=base_url)
+
         if self.streamable is not None:
-            r['streamable'] = save(self.streamable)
+            r['streamable'] = save(self.streamable, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.format is not None:
-            r['format'] = save(self.format)
+            r['format'] = save_relative_uri(self.format, base_url, True)
+
         if self.inputBinding is not None:
-            r['inputBinding'] = save(self.inputBinding)
+            r['inputBinding'] = save(self.inputBinding, top=False, base_url=base_url)
+
         if self.default is not None:
-            r['default'] = save(self.default)
+            r['default'] = save(self.default, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['label', 'secondaryFiles', 'streamable', 'doc', 'id', 'format', 'inputBinding', 'default', 'type'])
+    attrs = frozenset([u'label', u'secondaryFiles', u'streamable', u'doc', u'id', u'format', u'inputBinding', u'default', u'type'])
 
 
 class CommandOutputParameter(OutputParameter):
@@ -2777,7 +3357,7 @@ An output parameter for a CommandLineTool.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -2850,35 +3430,54 @@ An output parameter for a CommandLineTool.
             self.type = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `outputBinding`, `format`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `outputBinding`, `format`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandOutputParameter'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.secondaryFiles is not None:
-            r['secondaryFiles'] = save(self.secondaryFiles)
+            r['secondaryFiles'] = save(self.secondaryFiles, top=False, base_url=base_url)
+
         if self.streamable is not None:
-            r['streamable'] = save(self.streamable)
+            r['streamable'] = save(self.streamable, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
         if self.format is not None:
-            r['format'] = save(self.format)
+            r['format'] = save_relative_uri(self.format, base_url, True)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['label', 'secondaryFiles', 'streamable', 'doc', 'id', 'outputBinding', 'format', 'type'])
+    attrs = frozenset([u'label', u'secondaryFiles', u'streamable', u'doc', u'id', u'outputBinding', u'format', u'type'])
 
 
 class CommandLineTool(Process):
@@ -2892,7 +3491,11 @@ This defines the schema of the CWL Command Line Tool Description document.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'CommandLineTool':
+            raise ValidationException("Not a CommandLineTool")
+
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_union_of_None_type_or_strtype_True_False_None, baseuri, loadingOptions)
@@ -2906,7 +3509,7 @@ This defines the schema of the CWL Command Line Tool Description document.
             if docRoot is not None:
                 self.id = docRoot
             else:
-                raise ValidationException("Missing id")
+                self.id = "_:" + str(uuid.uuid4())
         baseuri = self.id
         try:
             self.inputs = load_field(doc.get('inputs'), idmap_inputs_array_of_CommandInputParameterLoader, baseuri, loadingOptions)
@@ -2957,11 +3560,6 @@ This defines the schema of the CWL Command Line Tool Description document.
                 errors.append(SourceLine(doc, 'cwlVersion', str).makeError("the `cwlVersion` field is not valid because:\n"+str(e)))
         else:
             self.cwlVersion = None
-
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
 
         if 'baseCommand' in doc:
             try:
@@ -3028,53 +3626,80 @@ This defines the schema of the CWL Command Line Tool Description document.
             self.permanentFailCodes = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`, `inputs`, `outputs`, `requirements`, `hints`, `label`, `doc`, `cwlVersion`, `class`, `baseCommand`, `arguments`, `stdin`, `stderr`, `stdout`, `successCodes`, `temporaryFailCodes`, `permanentFailCodes`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`, `inputs`, `outputs`, `requirements`, `hints`, `label`, `doc`, `cwlVersion`, `class`, `baseCommand`, `arguments`, `stdin`, `stderr`, `stdout`, `successCodes`, `temporaryFailCodes`, `permanentFailCodes`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'CommandLineTool'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'CommandLineTool'
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.inputs is not None:
-            r['inputs'] = save(self.inputs)
+            r['inputs'] = save(self.inputs, top=False, base_url=base_url)
+
         if self.outputs is not None:
-            r['outputs'] = save(self.outputs)
+            r['outputs'] = save(self.outputs, top=False, base_url=base_url)
+
         if self.requirements is not None:
-            r['requirements'] = save(self.requirements)
+            r['requirements'] = save(self.requirements, top=False, base_url=base_url)
+
         if self.hints is not None:
-            r['hints'] = save(self.hints)
+            r['hints'] = save(self.hints, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.cwlVersion is not None:
-            r['cwlVersion'] = save(self.cwlVersion)
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+            r['cwlVersion'] = save_relative_uri(self.cwlVersion, base_url, False)
+
         if self.baseCommand is not None:
-            r['baseCommand'] = save(self.baseCommand)
+            r['baseCommand'] = save(self.baseCommand, top=False, base_url=base_url)
+
         if self.arguments is not None:
-            r['arguments'] = save(self.arguments)
+            r['arguments'] = save(self.arguments, top=False, base_url=base_url)
+
         if self.stdin is not None:
-            r['stdin'] = save(self.stdin)
+            r['stdin'] = save(self.stdin, top=False, base_url=base_url)
+
         if self.stderr is not None:
-            r['stderr'] = save(self.stderr)
+            r['stderr'] = save(self.stderr, top=False, base_url=base_url)
+
         if self.stdout is not None:
-            r['stdout'] = save(self.stdout)
+            r['stdout'] = save(self.stdout, top=False, base_url=base_url)
+
         if self.successCodes is not None:
-            r['successCodes'] = save(self.successCodes)
+            r['successCodes'] = save(self.successCodes, top=False, base_url=base_url)
+
         if self.temporaryFailCodes is not None:
-            r['temporaryFailCodes'] = save(self.temporaryFailCodes)
+            r['temporaryFailCodes'] = save(self.temporaryFailCodes, top=False, base_url=base_url)
+
         if self.permanentFailCodes is not None:
-            r['permanentFailCodes'] = save(self.permanentFailCodes)
+            r['permanentFailCodes'] = save(self.permanentFailCodes, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['id', 'inputs', 'outputs', 'requirements', 'hints', 'label', 'doc', 'cwlVersion', 'class', 'baseCommand', 'arguments', 'stdin', 'stderr', 'stdout', 'successCodes', 'temporaryFailCodes', 'permanentFailCodes'])
+    attrs = frozenset([u'id', u'inputs', u'outputs', u'requirements', u'hints', u'label', u'doc', u'cwlVersion', u'class', u'baseCommand', u'arguments', u'stdin', u'stderr', u'stdout', u'successCodes', u'temporaryFailCodes', u'permanentFailCodes'])
 
 
 class DockerRequirement(ProcessRequirement):
@@ -3118,11 +3743,10 @@ environment as defined by Docker.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'DockerRequirement':
+            raise ValidationException("Not a DockerRequirement")
 
         if 'dockerPull' in doc:
             try:
@@ -3173,33 +3797,50 @@ environment as defined by Docker.
             self.dockerOutputDirectory = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `dockerPull`, `dockerLoad`, `dockerFile`, `dockerImport`, `dockerImageId`, `dockerOutputDirectory`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `dockerPull`, `dockerLoad`, `dockerFile`, `dockerImport`, `dockerImageId`, `dockerOutputDirectory`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'DockerRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'DockerRequirement'
+
         if self.dockerPull is not None:
-            r['dockerPull'] = save(self.dockerPull)
+            r['dockerPull'] = save(self.dockerPull, top=False, base_url=base_url)
+
         if self.dockerLoad is not None:
-            r['dockerLoad'] = save(self.dockerLoad)
+            r['dockerLoad'] = save(self.dockerLoad, top=False, base_url=base_url)
+
         if self.dockerFile is not None:
-            r['dockerFile'] = save(self.dockerFile)
+            r['dockerFile'] = save(self.dockerFile, top=False, base_url=base_url)
+
         if self.dockerImport is not None:
-            r['dockerImport'] = save(self.dockerImport)
+            r['dockerImport'] = save(self.dockerImport, top=False, base_url=base_url)
+
         if self.dockerImageId is not None:
-            r['dockerImageId'] = save(self.dockerImageId)
+            r['dockerImageId'] = save(self.dockerImageId, top=False, base_url=base_url)
+
         if self.dockerOutputDirectory is not None:
-            r['dockerOutputDirectory'] = save(self.dockerOutputDirectory)
+            r['dockerOutputDirectory'] = save(self.dockerOutputDirectory, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'dockerPull', 'dockerLoad', 'dockerFile', 'dockerImport', 'dockerImageId', 'dockerOutputDirectory'])
+    attrs = frozenset([u'class', u'dockerPull', u'dockerLoad', u'dockerFile', u'dockerImport', u'dockerImageId', u'dockerOutputDirectory'])
 
 
 class SoftwareRequirement(ProcessRequirement):
@@ -3214,11 +3855,10 @@ the defined process.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'SoftwareRequirement':
+            raise ValidationException("Not a SoftwareRequirement")
 
         try:
             self.packages = load_field(doc.get('packages'), idmap_packages_array_of_SoftwarePackageLoader, baseuri, loadingOptions)
@@ -3226,23 +3866,35 @@ the defined process.
             errors.append(SourceLine(doc, 'packages', str).makeError("the `packages` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `packages`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `packages`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'SoftwareRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'SoftwareRequirement'
+
         if self.packages is not None:
-            r['packages'] = save(self.packages)
+            r['packages'] = save(self.packages, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'packages'])
+    attrs = frozenset([u'class', u'packages'])
 
 
 class SoftwarePackage(Savable):
@@ -3252,7 +3904,7 @@ class SoftwarePackage(Savable):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         try:
             self.package = load_field(doc.get('package'), strtype, baseuri, loadingOptions)
         except ValidationException as e:
@@ -3275,25 +3927,39 @@ class SoftwarePackage(Savable):
             self.specs = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `package`, `version`, `specs`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `package`, `version`, `specs`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'SoftwarePackage'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.package is not None:
-            r['package'] = save(self.package)
+            r['package'] = save(self.package, top=False, base_url=base_url)
+
         if self.version is not None:
-            r['version'] = save(self.version)
+            r['version'] = save(self.version, top=False, base_url=base_url)
+
         if self.specs is not None:
-            r['specs'] = save(self.specs)
+            r['specs'] = save(self.specs, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['package', 'version', 'specs'])
+    attrs = frozenset([u'package', u'version', u'specs'])
 
 
 class Dirent(Savable):
@@ -3310,7 +3976,7 @@ template.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'entryname' in doc:
             try:
                 self.entryname = load_field(doc.get('entryname'), union_of_None_type_or_strtype_or_ExpressionLoader, baseuri, loadingOptions)
@@ -3333,25 +3999,39 @@ template.
             self.writable = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `entryname`, `entry`, `writable`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `entryname`, `entry`, `writable`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'Dirent'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.entryname is not None:
-            r['entryname'] = save(self.entryname)
+            r['entryname'] = save(self.entryname, top=False, base_url=base_url)
+
         if self.entry is not None:
-            r['entry'] = save(self.entry)
+            r['entry'] = save(self.entry, top=False, base_url=base_url)
+
         if self.writable is not None:
-            r['writable'] = save(self.writable)
+            r['writable'] = save(self.writable, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['entryname', 'entry', 'writable'])
+    attrs = frozenset([u'entryname', u'entry', u'writable'])
 
 
 class InitialWorkDirRequirement(ProcessRequirement):
@@ -3364,11 +4044,10 @@ Define a list of files and subdirectories that must be created by the workflow p
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'InitialWorkDirRequirement':
+            raise ValidationException("Not a InitialWorkDirRequirement")
 
         try:
             self.listing = load_field(doc.get('listing'), union_of_array_of_union_of_FileLoader_or_DirectoryLoader_or_DirentLoader_or_strtype_or_ExpressionLoader_or_strtype_or_ExpressionLoader, baseuri, loadingOptions)
@@ -3376,23 +4055,35 @@ Define a list of files and subdirectories that must be created by the workflow p
             errors.append(SourceLine(doc, 'listing', str).makeError("the `listing` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `listing`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `listing`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'InitialWorkDirRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'InitialWorkDirRequirement'
+
         if self.listing is not None:
-            r['listing'] = save(self.listing)
+            r['listing'] = save(self.listing, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'listing'])
+    attrs = frozenset([u'class', u'listing'])
 
 
 class EnvVarRequirement(ProcessRequirement):
@@ -3407,11 +4098,10 @@ execution environment of the tool.  See `EnvironmentDef` for details.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'EnvVarRequirement':
+            raise ValidationException("Not a EnvVarRequirement")
 
         try:
             self.envDef = load_field(doc.get('envDef'), idmap_envDef_array_of_EnvironmentDefLoader, baseuri, loadingOptions)
@@ -3419,23 +4109,35 @@ execution environment of the tool.  See `EnvironmentDef` for details.
             errors.append(SourceLine(doc, 'envDef', str).makeError("the `envDef` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `envDef`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `envDef`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'EnvVarRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'EnvVarRequirement'
+
         if self.envDef is not None:
-            r['envDef'] = save(self.envDef)
+            r['envDef'] = save(self.envDef, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'envDef'])
+    attrs = frozenset([u'class', u'envDef'])
 
 
 class ShellCommandRequirement(ProcessRequirement):
@@ -3455,28 +4157,38 @@ the use of shell metacharacters such as `|` for pipes.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'ShellCommandRequirement':
+            raise ValidationException("Not a ShellCommandRequirement")
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'ShellCommandRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'ShellCommandRequirement'
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class'])
+    attrs = frozenset([u'class'])
 
 
 class ResourceRequirement(ProcessRequirement):
@@ -3509,11 +4221,10 @@ If neither "min" nor "max" is specified for a resource, an implementation may pr
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'ResourceRequirement':
+            raise ValidationException("Not a ResourceRequirement")
 
         if 'coresMin' in doc:
             try:
@@ -3580,37 +4291,56 @@ If neither "min" nor "max" is specified for a resource, an implementation may pr
             self.outdirMax = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `coresMin`, `coresMax`, `ramMin`, `ramMax`, `tmpdirMin`, `tmpdirMax`, `outdirMin`, `outdirMax`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`, `coresMin`, `coresMax`, `ramMin`, `ramMax`, `tmpdirMin`, `tmpdirMax`, `outdirMin`, `outdirMax`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'ResourceRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'ResourceRequirement'
+
         if self.coresMin is not None:
-            r['coresMin'] = save(self.coresMin)
+            r['coresMin'] = save(self.coresMin, top=False, base_url=base_url)
+
         if self.coresMax is not None:
-            r['coresMax'] = save(self.coresMax)
+            r['coresMax'] = save(self.coresMax, top=False, base_url=base_url)
+
         if self.ramMin is not None:
-            r['ramMin'] = save(self.ramMin)
+            r['ramMin'] = save(self.ramMin, top=False, base_url=base_url)
+
         if self.ramMax is not None:
-            r['ramMax'] = save(self.ramMax)
+            r['ramMax'] = save(self.ramMax, top=False, base_url=base_url)
+
         if self.tmpdirMin is not None:
-            r['tmpdirMin'] = save(self.tmpdirMin)
+            r['tmpdirMin'] = save(self.tmpdirMin, top=False, base_url=base_url)
+
         if self.tmpdirMax is not None:
-            r['tmpdirMax'] = save(self.tmpdirMax)
+            r['tmpdirMax'] = save(self.tmpdirMax, top=False, base_url=base_url)
+
         if self.outdirMin is not None:
-            r['outdirMin'] = save(self.outdirMin)
+            r['outdirMin'] = save(self.outdirMin, top=False, base_url=base_url)
+
         if self.outdirMax is not None:
-            r['outdirMax'] = save(self.outdirMax)
+            r['outdirMax'] = save(self.outdirMax, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class', 'coresMin', 'coresMax', 'ramMin', 'ramMax', 'tmpdirMin', 'tmpdirMax', 'outdirMin', 'outdirMax'])
+    attrs = frozenset([u'class', u'coresMin', u'coresMax', u'ramMin', u'ramMax', u'tmpdirMin', u'tmpdirMax', u'outdirMin', u'outdirMax'])
 
 
 class ExpressionToolOutputParameter(OutputParameter):
@@ -3620,7 +4350,7 @@ class ExpressionToolOutputParameter(OutputParameter):
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -3693,35 +4423,54 @@ class ExpressionToolOutputParameter(OutputParameter):
             self.type = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `outputBinding`, `format`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `outputBinding`, `format`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'ExpressionToolOutputParameter'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.secondaryFiles is not None:
-            r['secondaryFiles'] = save(self.secondaryFiles)
+            r['secondaryFiles'] = save(self.secondaryFiles, top=False, base_url=base_url)
+
         if self.streamable is not None:
-            r['streamable'] = save(self.streamable)
+            r['streamable'] = save(self.streamable, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
         if self.format is not None:
-            r['format'] = save(self.format)
+            r['format'] = save_relative_uri(self.format, base_url, True)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['label', 'secondaryFiles', 'streamable', 'doc', 'id', 'outputBinding', 'format', 'type'])
+    attrs = frozenset([u'label', u'secondaryFiles', u'streamable', u'doc', u'id', u'outputBinding', u'format', u'type'])
 
 
 class ExpressionTool(Process):
@@ -3735,7 +4484,11 @@ Execute an expression as a Workflow step.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'ExpressionTool':
+            raise ValidationException("Not a ExpressionTool")
+
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_union_of_None_type_or_strtype_True_False_None, baseuri, loadingOptions)
@@ -3749,7 +4502,7 @@ Execute an expression as a Workflow step.
             if docRoot is not None:
                 self.id = docRoot
             else:
-                raise ValidationException("Missing id")
+                self.id = "_:" + str(uuid.uuid4())
         baseuri = self.id
         try:
             self.inputs = load_field(doc.get('inputs'), idmap_inputs_array_of_InputParameterLoader, baseuri, loadingOptions)
@@ -3802,49 +4555,64 @@ Execute an expression as a Workflow step.
             self.cwlVersion = None
 
         try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
-
-        try:
             self.expression = load_field(doc.get('expression'), union_of_strtype_or_ExpressionLoader, baseuri, loadingOptions)
         except ValidationException as e:
             errors.append(SourceLine(doc, 'expression', str).makeError("the `expression` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`, `inputs`, `outputs`, `requirements`, `hints`, `label`, `doc`, `cwlVersion`, `class`, `expression`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`, `inputs`, `outputs`, `requirements`, `hints`, `label`, `doc`, `cwlVersion`, `class`, `expression`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'ExpressionTool'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'ExpressionTool'
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.inputs is not None:
-            r['inputs'] = save(self.inputs)
+            r['inputs'] = save(self.inputs, top=False, base_url=base_url)
+
         if self.outputs is not None:
-            r['outputs'] = save(self.outputs)
+            r['outputs'] = save(self.outputs, top=False, base_url=base_url)
+
         if self.requirements is not None:
-            r['requirements'] = save(self.requirements)
+            r['requirements'] = save(self.requirements, top=False, base_url=base_url)
+
         if self.hints is not None:
-            r['hints'] = save(self.hints)
+            r['hints'] = save(self.hints, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.cwlVersion is not None:
-            r['cwlVersion'] = save(self.cwlVersion)
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+            r['cwlVersion'] = save_relative_uri(self.cwlVersion, base_url, False)
+
         if self.expression is not None:
-            r['expression'] = save(self.expression)
+            r['expression'] = save(self.expression, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['id', 'inputs', 'outputs', 'requirements', 'hints', 'label', 'doc', 'cwlVersion', 'class', 'expression'])
+    attrs = frozenset([u'id', u'inputs', u'outputs', u'requirements', u'hints', u'label', u'doc', u'cwlVersion', u'class', u'expression'])
 
 
 class WorkflowOutputParameter(OutputParameter):
@@ -3860,7 +4628,7 @@ provide the value of the output parameter.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -3949,39 +4717,60 @@ provide the value of the output parameter.
             self.type = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `outputBinding`, `format`, `outputSource`, `linkMerge`, `type`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `label`, `secondaryFiles`, `streamable`, `doc`, `id`, `outputBinding`, `format`, `outputSource`, `linkMerge`, `type`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'WorkflowOutputParameter'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.secondaryFiles is not None:
-            r['secondaryFiles'] = save(self.secondaryFiles)
+            r['secondaryFiles'] = save(self.secondaryFiles, top=False, base_url=base_url)
+
         if self.streamable is not None:
-            r['streamable'] = save(self.streamable)
+            r['streamable'] = save(self.streamable, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.outputBinding is not None:
-            r['outputBinding'] = save(self.outputBinding)
+            r['outputBinding'] = save(self.outputBinding, top=False, base_url=base_url)
+
         if self.format is not None:
-            r['format'] = save(self.format)
+            r['format'] = save_relative_uri(self.format, base_url, True)
+
         if self.outputSource is not None:
-            r['outputSource'] = save(self.outputSource)
+            r['outputSource'] = save_relative_uri(self.outputSource, base_url, False)
+
         if self.linkMerge is not None:
-            r['linkMerge'] = save(self.linkMerge)
+            r['linkMerge'] = save(self.linkMerge, top=False, base_url=base_url)
+
         if self.type is not None:
-            r['type'] = save(self.type)
+            r['type'] = save(self.type, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['label', 'secondaryFiles', 'streamable', 'doc', 'id', 'outputBinding', 'format', 'outputSource', 'linkMerge', 'type'])
+    attrs = frozenset([u'label', u'secondaryFiles', u'streamable', u'doc', u'id', u'outputBinding', u'format', u'outputSource', u'linkMerge', u'type'])
 
 
 class Sink(Savable):
@@ -4036,7 +4825,7 @@ specified, the default method is "merge_nested".
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -4085,29 +4874,45 @@ specified, the default method is "merge_nested".
             self.valueFrom = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `source`, `linkMerge`, `id`, `default`, `valueFrom`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `source`, `linkMerge`, `id`, `default`, `valueFrom`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'WorkflowStepInput'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.source is not None:
-            r['source'] = save(self.source)
+            r['source'] = save_relative_uri(self.source, base_url, False)
+
         if self.linkMerge is not None:
-            r['linkMerge'] = save(self.linkMerge)
+            r['linkMerge'] = save(self.linkMerge, top=False, base_url=base_url)
+
         if self.default is not None:
-            r['default'] = save(self.default)
+            r['default'] = save(self.default, top=False, base_url=base_url)
+
         if self.valueFrom is not None:
-            r['valueFrom'] = save(self.valueFrom)
+            r['valueFrom'] = save(self.valueFrom, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['source', 'linkMerge', 'id', 'default', 'valueFrom'])
+    attrs = frozenset([u'source', u'linkMerge', u'id', u'default', u'valueFrom'])
 
 
 class WorkflowStepOutput(Savable):
@@ -4124,7 +4929,7 @@ with an output parameter of the process.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -4141,21 +4946,33 @@ with an output parameter of the process.
                 raise ValidationException("Missing id")
         baseuri = self.id
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'WorkflowStepOutput'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['id'])
+    attrs = frozenset([u'id'])
 
 
 class WorkflowStep(Savable):
@@ -4223,7 +5040,7 @@ a subworkflow (recursive workflows are not allowed).
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_strtype_True_False_None, baseuri, loadingOptions)
@@ -4303,39 +5120,60 @@ a subworkflow (recursive workflows are not allowed).
             self.scatterMethod = None
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`, `in`, `out`, `requirements`, `hints`, `label`, `doc`, `run`, `scatter`, `scatterMethod`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`, `in`, `out`, `requirements`, `hints`, `label`, `doc`, `run`, `scatter`, `scatterMethod`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'WorkflowStep'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.in_ is not None:
-            r['in'] = save(self.in_)
+            r['in'] = save(self.in_, top=False, base_url=base_url)
+
         if self.out is not None:
-            r['out'] = save(self.out)
+            r['out'] = save_relative_uri(self.out, base_url, True)
+
         if self.requirements is not None:
-            r['requirements'] = save(self.requirements)
+            r['requirements'] = save(self.requirements, top=False, base_url=base_url)
+
         if self.hints is not None:
-            r['hints'] = save(self.hints)
+            r['hints'] = save(self.hints, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.run is not None:
-            r['run'] = save(self.run)
+            r['run'] = save_relative_uri(self.run, base_url, False)
+
         if self.scatter is not None:
-            r['scatter'] = save(self.scatter)
+            r['scatter'] = save_relative_uri(self.scatter, base_url, False)
+
         if self.scatterMethod is not None:
-            r['scatterMethod'] = save(self.scatterMethod)
+            r['scatterMethod'] = save_relative_uri(self.scatterMethod, base_url, False)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['id', 'in', 'out', 'requirements', 'hints', 'label', 'doc', 'run', 'scatter', 'scatterMethod'])
+    attrs = frozenset([u'id', u'in', u'out', u'requirements', u'hints', u'label', u'doc', u'run', u'scatter', u'scatterMethod'])
 
 
 class Workflow(Process):
@@ -4393,7 +5231,11 @@ workflow semantics.
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'Workflow':
+            raise ValidationException("Not a Workflow")
+
         if 'id' in doc:
             try:
                 self.id = load_field(doc.get('id'), uri_union_of_None_type_or_strtype_True_False_None, baseuri, loadingOptions)
@@ -4407,7 +5249,7 @@ workflow semantics.
             if docRoot is not None:
                 self.id = docRoot
             else:
-                raise ValidationException("Missing id")
+                self.id = "_:" + str(uuid.uuid4())
         baseuri = self.id
         try:
             self.inputs = load_field(doc.get('inputs'), idmap_inputs_array_of_InputParameterLoader, baseuri, loadingOptions)
@@ -4460,49 +5302,64 @@ workflow semantics.
             self.cwlVersion = None
 
         try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
-
-        try:
             self.steps = load_field(doc.get('steps'), idmap_steps_union_of_array_of_WorkflowStepLoader, baseuri, loadingOptions)
         except ValidationException as e:
             errors.append(SourceLine(doc, 'steps', str).makeError("the `steps` field is not valid because:\n"+str(e)))
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`, `inputs`, `outputs`, `requirements`, `hints`, `label`, `doc`, `cwlVersion`, `class`, `steps`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `id`, `inputs`, `outputs`, `requirements`, `hints`, `label`, `doc`, `cwlVersion`, `class`, `steps`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'Workflow'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'Workflow'
+
         if self.id is not None:
-            r['id'] = save(self.id)
+            r['id'] = save_relative_uri(self.id, base_url, True)
+
         if self.inputs is not None:
-            r['inputs'] = save(self.inputs)
+            r['inputs'] = save(self.inputs, top=False, base_url=base_url)
+
         if self.outputs is not None:
-            r['outputs'] = save(self.outputs)
+            r['outputs'] = save(self.outputs, top=False, base_url=base_url)
+
         if self.requirements is not None:
-            r['requirements'] = save(self.requirements)
+            r['requirements'] = save(self.requirements, top=False, base_url=base_url)
+
         if self.hints is not None:
-            r['hints'] = save(self.hints)
+            r['hints'] = save(self.hints, top=False, base_url=base_url)
+
         if self.label is not None:
-            r['label'] = save(self.label)
+            r['label'] = save(self.label, top=False, base_url=base_url)
+
         if self.doc is not None:
-            r['doc'] = save(self.doc)
+            r['doc'] = save(self.doc, top=False, base_url=base_url)
+
         if self.cwlVersion is not None:
-            r['cwlVersion'] = save(self.cwlVersion)
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+            r['cwlVersion'] = save_relative_uri(self.cwlVersion, base_url, False)
+
         if self.steps is not None:
-            r['steps'] = save(self.steps)
+            r['steps'] = save(self.steps, top=False, base_url=base_url)
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['id', 'inputs', 'outputs', 'requirements', 'hints', 'label', 'doc', 'cwlVersion', 'class', 'steps'])
+    attrs = frozenset([u'id', u'inputs', u'outputs', u'requirements', u'hints', u'label', u'doc', u'cwlVersion', u'class', u'steps'])
 
 
 class SubworkflowFeatureRequirement(ProcessRequirement):
@@ -4517,28 +5374,38 @@ the `run` field of [WorkflowStep](#WorkflowStep).
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'SubworkflowFeatureRequirement':
+            raise ValidationException("Not a SubworkflowFeatureRequirement")
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'SubworkflowFeatureRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'SubworkflowFeatureRequirement'
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class'])
+    attrs = frozenset([u'class'])
 
 
 class ScatterFeatureRequirement(ProcessRequirement):
@@ -4553,28 +5420,38 @@ Indicates that the workflow platform must support the `scatter` and
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'ScatterFeatureRequirement':
+            raise ValidationException("Not a ScatterFeatureRequirement")
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'ScatterFeatureRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'ScatterFeatureRequirement'
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class'])
+    attrs = frozenset([u'class'])
 
 
 class MultipleInputFeatureRequirement(ProcessRequirement):
@@ -4589,28 +5466,38 @@ listed in the `source` field of [WorkflowStepInput](#WorkflowStepInput).
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'MultipleInputFeatureRequirement':
+            raise ValidationException("Not a MultipleInputFeatureRequirement")
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'MultipleInputFeatureRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'MultipleInputFeatureRequirement'
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class'])
+    attrs = frozenset([u'class'])
 
 
 class StepInputExpressionRequirement(ProcessRequirement):
@@ -4625,28 +5512,38 @@ of [WorkflowStepInput](#WorkflowStepInput).
             doc.lc.data = _doc.lc.data
             doc.lc.filename = _doc.lc.filename
         errors = []
-        #doc = {expand_url(d, u"", loadingOptions, scoped_id=False, vocab_term=True): v for d,v in doc.items()}
-        try:
-            self.class_ = load_field(doc.get('class'), uri_strtype_False_True_None, baseuri, loadingOptions)
-        except ValidationException as e:
-            errors.append(SourceLine(doc, 'class', str).makeError("the `class` field is not valid because:\n"+str(e)))
+        self.loadingOptions = loadingOptions
+
+        if doc.get('class') != 'StepInputExpressionRequirement':
+            raise ValidationException("Not a StepInputExpressionRequirement")
 
 
+        self.extension_fields = {}
         for k in doc.keys():
             if k not in self.attrs:
-                errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
-                break
+                if ":" in k:
+                    ex = expand_url(k, u"", loadingOptions, scoped_id=False, vocab_term=False)
+                    self.extension_fields[ex] = doc[k]
+                else:
+                    errors.append(SourceLine(doc, k, str).makeError("invalid field `%s`, expected one of: `class`" % (k)))
+                    break
 
         if errors:
             raise ValidationException("Trying 'StepInputExpressionRequirement'\n"+"\n".join(errors))
 
-    def save(self):
+    def save(self, top=False, base_url=""):
         r = {}
-        if self.class_ is not None:
-            r['class'] = save(self.class_)
+        for ef in self.extension_fields:
+            r[prefix_url(ef, self.loadingOptions.vocab)] = self.extension_fields[ef]
+
+        r['class'] = 'StepInputExpressionRequirement'
+
+        if top and self.loadingOptions.namespaces:
+            r["$namespaces"] = self.loadingOptions.namespaces
+
         return r
 
-    attrs = frozenset(['class'])
+    attrs = frozenset([u'class'])
 
 
 _vocab = {
@@ -4848,12 +5745,12 @@ _rvocab = {
     "https://w3id.org/cwl/cwl#v1.0.dev4": "v1.0.dev4",
 }
 
-strtype = _PrimitiveLoader((str, six.text_type))
 inttype = _PrimitiveLoader(int)
-floattype = _PrimitiveLoader(float)
 booltype = _PrimitiveLoader(bool)
-None_type = _PrimitiveLoader(type(None))
+strtype = _PrimitiveLoader((str, six.text_type))
 Any_type = _AnyLoader()
+floattype = _PrimitiveLoader(float)
+None_type = _PrimitiveLoader(type(None))
 PrimitiveTypeLoader = _EnumLoader(("null", "boolean", "int", "long", "float", "double", "string",))
 AnyLoader = _EnumLoader(("Any",))
 RecordFieldLoader = _RecordLoader(RecordField)
@@ -5066,7 +5963,7 @@ union_of_CommandLineToolLoader_or_ExpressionToolLoader_or_WorkflowLoader_or_arra
 
 def load_document(doc, baseuri=None, loadingOptions=None):
     if baseuri is None:
-        baseuri = file_uri(os.getcwd(), True) + "/"
+        baseuri = file_uri(os.getcwd()) + "/"
     if loadingOptions is None:
         loadingOptions = LoadingOptions()
     return _document_load(union_of_CommandLineToolLoader_or_ExpressionToolLoader_or_WorkflowLoader_or_array_of_union_of_CommandLineToolLoader_or_ExpressionToolLoader_or_WorkflowLoader, doc, baseuri, loadingOptions)

@@ -22,7 +22,7 @@ class BasicCWLNodeDict(UserDict, BasicCWLNode):
             if isinstance(value, dict):
                 new_data[key] = BasicCWLNodeDict(value, self._path + [key])
             elif isinstance(value, list):
-                new_data[key] = BasicCWLNodeDict(value, self._path + [key])
+                new_data[key] = BasicCWLNodeList(value, self._path + [key])
             else:
                 new_data[key] = value
 
@@ -40,7 +40,7 @@ class BasicCWLNodeList(UserList, BasicCWLNode):
             if isinstance(x, dict):
                 new_data.append(BasicCWLNodeDict(x, self._path + [i]))
             elif isinstance(x, list):
-                new_data.append(BasicCWLNodeDict(x, self._path + [i]))
+                new_data.append(BasicCWLNodeList(x, self._path + [i]))
             else:
                 new_data.append(x)
 

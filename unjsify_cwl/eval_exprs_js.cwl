@@ -23,9 +23,9 @@ requirements:
           const expressions = JSON.parse(fs.readFileSync("expressions.json"))["expressions"];
           const expressionLib = fs.readFileSync("expressionLib.js");
 
-          if(!Array.isArray(input_values)){
-            input_values = [input_values];
-          }
+          // if(!Array.isArray(input_values)){
+          //  input_values = [input_values];
+          // }
 
           if(input_values.length !== input_names.length){
             throw Error(input_values.length + "!==" + input_names.length)
@@ -33,16 +33,18 @@ requirements:
 
           let inputs = {};
           input_values.forEach((input_value, i) => {
-            inputs[input_names[i]] = input_value;
-          })
+            const input_name = input_names[i];
 
-          const context_console_ob = Object.freeze({
-            log: (str) => {
-              console.log(str)
-            },
-            error: (str) => {
-              console.error(str)
+            if(Array.isArray(input_name)){
+              console.error("hi", input_name, input_value)
+              if(input_value === null){
+                inputs[input_name[0]] = input_name[1];
+              }
+              else{
+                inputs[input_name[0]] = input_value;
+              }
             }
+            inputs[input_name] = input_value;
           })
 
           const new_expressions = expressions.map((expression) => {
@@ -51,16 +53,26 @@ requirements:
             else
               expression.expr = expression.expr.slice(2, -1);
 
-            if(inputs[expression.self] === undefined){
+            if(expression.self !== null && inputs[expression.self] === undefined){
               throw Error("Invalid self value " + expression.self);
             }
 
-            return require("vm").runInNewContext(expressionLib + ";" + expression.expr, {
+            return require("vm").runInNewContext(expressionLib + "var result = " + expression.expr + ";result", {
                 inputs: inputs,
                 self: expression.self == null?null:inputs[expression.self],
-                runtime: undefined
+                runtime: undefined,
+                console: Object.freeze({
+                  log: (str) => {
+                    console.log(str)
+                  },
+                  error: (str) => {
+                    console.error(str)
+                  }
+                })
             });
           })
+
+          console.log(JSON.stringify({output:new_expressions}));
 
           fs.writeFileSync("cwl.output.json", JSON.stringify({
             output:new_expressions
@@ -72,11 +84,9 @@ baseCommand:
 
 inputs:
   - id: input_values
-    type: Any
+    type: Any?
   - id: input_names
-    type:
-      type: array
-      items: string
+    type: Any
   - id: expressions
     type: Any
   - id: expressionLib

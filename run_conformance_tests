@@ -9,6 +9,6 @@ if [ ! -d "conformance_test_data" ]; then
 fi
 
 # Run the conformance tests
-env PATH="$PATH":"$(pwd)" ../common-workflow-language/run_test.sh -n1 RUNNER="__conformance_test_runner"
+env PATH="$PATH":"$(pwd)" ../common-workflow-language/run_test.sh "$@" RUNNER="__conformance_test_runner"
 
 popd > /dev/null || exit

@@ -11,12 +11,14 @@ from typing import Any, Dict
 import types
 import tempfile
 import logging
+from collections import namedtuple
+import time
 
 import pkg_resources
 import ruamel.yaml as yaml
 
 from .get_expressions import scan_expression, is_parameter_reference
-
+from . import cwl_model
 
 def dict_map(func, d):
     return dict([func(key, value) for key, value in d.items()])
@@ -86,12 +88,19 @@ def map_to_array(cwl_map, id_token="id", secondary_symbol="source"):
 def is_path_in(test_path, containing_path):
     return path.commonpath([path.abspath(test_path), path.abspath(containing_path)]) == path.abspath(containing_path)
 
-def unjsify(workflow_location: str, outdir: str, base_cwldir: str):
+def unjsify(workflow_location: str, outdir: str, base_cwldir: str, language: str):
     if not path.isdir(outdir):
         os.mkdir(outdir)
 
-    with open(path.join(outdir, "eval_exprs.cwl"), "wb+") as eval_exprs_dest:
-        with pkg_resources.resource_stream(__name__, "eval_exprs.cwl") as eval_exprs_source:
+    if language == "js":
+        eval_exprs_filename = "eval_exprs_js.cwl"
+    elif language == "python":
+        eval_exprs_filename = "eval_exprs_python.cwl"
+    else:
+        raise ValueError
+
+    with open(path.join(outdir, "eval_exprs.cwl"), "wb") as eval_exprs_dest:
+        with pkg_resources.resource_stream(__name__, eval_exprs_filename) as eval_exprs_source:
             shutil.copyfileobj(eval_exprs_source, eval_exprs_dest)
 
     return unjsify_workflow(workflow_location, outdir, base_cwldir)
@@ -115,14 +124,77 @@ def frozon(json_ob):
 
 cwl_file_cache = {} # type: Dict[str, Any]
 
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
+
+def pureify(cwl):
+    def pureify_node(node):
+        if isinstance(node, CommentedMap):
+            return dict(node)
+        elif isinstance(node, CommentedSeq):
+            return list(node)
+        else:
+            return node
+
+    return inplace_nested_map(pureify_node, cwl)
+
+def expand_cwl(cwl, cwl_dir):
+    if isinstance(cwl, dict):
+        if "$include" in cwl:
+            with open(path.join(cwl_dir, cwl["$include"])) as fp:
+                return fp.read()
+        elif "$import" in cwl:
+            with open(path.join(cwl_dir, cwl["$import"])) as fp:
+                return yaml.load(fp, Loader=yaml.Loader)
+        else:
+            for key, value in cwl.items():
+                cwl[key] = expand_cwl(value, cwl_dir)
+
+        return cwl
+    elif isinstance(cwl, list):
+        for i, item in enumerate(cwl):
+            cwl[i] = expand_cwl(item, cwl_dir)
+
+        return cwl
+    else:
+        return cwl
+
+def relativise(cwl, base_cwl_filename):
+    this_cwl_filename = "file://" + base_cwl_filename
+
+    def relativise_str(s, base_id):
+        if s.startswith(base_id):
+            return s[len(base_id) + 1:].replace("#", "")
+        elif s.startswith(this_cwl_filename):
+            return "#" + s[len(this_cwl_filename) + 1:].replace("#", "")
+        elif s.startswith("file://"):
+            return path.relpath(base_id, s)
+        else:
+            return s
+
+    def relativise_node(node, base_id):
+        if isinstance(node, dict) and node.get("id") is not None:
+            old_node_id = node["id"]
+            node["id"] = relativise_str(node["id"], base_id)
+            base_id = old_node_id
+        if isinstance(node, str):
+            return relativise_str(node, base_id), base_id
+        else:
+            return node, base_id
+
+    return inplace_nested_map_with_state(relativise_node, cwl, this_cwl_filename)
+
+def load_cwl_document(cwl_path):
+    # url = "file://" + path.abspath(cwl_path)
+    # raw_cwl = metaschema_loader.fetch(url)
+    # schema_doc, _ = metaschema_loader.resolve_all(raw_cwl, url)
+    print(cwl_path, file=sys.stderr)
+    return relativise(
+        cwl_model.save(cwl_model.load_document("file://" + path.abspath(cwl_path), "")),
+        path.abspath(cwl_path)
+    )
+
 def get_cwl(cwl_path):
     global cwl_file_cache
-    # if cwl_path[:5] != "file:":
-    #     cwl_path = f"file://{path.abspath(cwl_path)}"
-
-    # document_loader, workflowobj, uri = fetch_document(cwl_path)
-    # document_loader, _, _, _, _ = validate_document(document_loader, workflowobj, uri, strict=False, preprocess_only=True)
-    # return document_loader.resolve_ref(uri)[0]
 
     hash_pos = cwl_path.find("#")
 
@@ -133,15 +205,20 @@ def get_cwl(cwl_path):
     if cwl_file_cache.get(cwl_path) is not None:
         cwl = cwl_file_cache[cwl_path]
     else:
-        with open(cwl_path) as fp:
-            cwl = yaml.load(fp, Loader=yaml.Loader)
+        cwl = load_cwl_document(cwl_path)
 
         cwl_file_cache[cwl_path] = copy.deepcopy(cwl)
 
     if hash_pos != -1:
-        return get_cwl_map(cwl["$graph"], hash_part)
+        assert isinstance(cwl, list)
 
-    return cwl
+        for cwl_file in cwl:
+            if cwl_file["id"] == hash_part:
+                return pureify(cwl)
+
+        raise ValueError(f"Not found hash {hash_pos} in cwl graph")
+    else:
+        return pureify(cwl)
 
 def resolve_path(current_workflow, path_to_resolve):
     if path_to_resolve[0] == "#":
@@ -160,6 +237,9 @@ def iterate(func):
     while True:
         yield func()
 
+def flatten(lst):
+    return [item for sublist in lst for item in sublist]
+
 def get_identity_workflow(steps_names):
     return {
         "class": "Workflow",
@@ -172,15 +252,105 @@ def get_identity_workflow(steps_names):
     }
 
 def steralize_name(name: str):
-    return name.replace("#", "")
+    try:
+        return name.replace("#", "")
+    except Exception:
+        import pdb; pdb.set_trace()
 
 JSONType = Dict[str, Any]
 
 EVAL_WORKFLOW_EXPRS = "__eval_workflow_exprs"
-EVAL_WORKFLOW_EXPRS = "__eval_workflow_exprs"
 PROCESS_WORKFLOW_EXPRS = "__process_workflow_exprs"
 EVAL_INPUT_EXPRS = "__eval_input_exprs"
 EVAL_OUTPUT_EXPRS = "__eval_output_exprs"
+
+WorkflowExprReplacement = namedtuple(
+    "WorkflowExprReplacement",
+    ["id", "new_valueFrom", "processing_expressions"]
+)
+
+def get_workflow_expr_replacements(step):
+    workflow_ids = []
+    new_value_froms = []
+    processing_expressions = []
+    for step_in in step["in"]:
+        if isinstance(step_in, dict):
+            if step_in.get("valueFrom") is not None:
+                found_expr = False
+                def on_found_workflow_expr(expression):
+                    nonlocal found_expr
+
+                    found_expr = True
+                    processing_expressions.append({"self": f'{step_in["id"]}', "expr": expression})
+                    parameter_reference = f"inputs.{OUTPUT_EXPR_SYMBOL}[{len(processing_expressions) - 1}]"
+
+                    return parameter_reference
+
+                new_valueFrom = replace_expr(step_in["valueFrom"], on_found_workflow_expr)
+
+                if found_expr:
+                    workflow_ids.append(step_in["id"])
+                    new_value_froms.append(new_valueFrom)
+
+    return workflow_ids, new_value_froms, processing_expressions
+
+
+def unjsify_workflow_exprs(workflow_step, eval_exprs_location, expressionLib):
+    ids, new_value_froms, processing_expressions = get_workflow_expr_replacements(workflow_step)
+    new_workflow_step = copy.deepcopy(workflow_step)
+
+    if expressionLib is None:
+        workflow_expression_lib_dict = {}
+    else:
+        workflow_expression_lib_dict = {
+            "expressionLib": {
+                "default": ";".join(expressionLib)
+            }
+        }
+
+    for id_to_delete in ids:
+        del new_workflow_step["in"][id_to_delete]["valueFrom"]
+
+    workflow_expr_step = {
+        "id": EVAL_WORKFLOW_EXPRS,
+        "run": eval_exprs_location,
+        "in": {
+            "input_values": {
+                "source": list(workflow_step["in"].keys())
+            },
+            "input_names": {
+                "default": list(workflow_step["in"].keys())
+            },
+            "expressions": {
+                "default": processing_expressions
+            },
+            **workflow_expression_lib_dict
+        },
+        "out": ["output"]
+    }
+
+    workflow_expr_process_step = {
+        "id": PROCESS_WORKFLOW_EXPRS,
+        "in": {
+            "__output_exprs": "__eval_workflow_exprs/output",
+            **dict(list(map(
+                lambda x: (
+                    x[0] + "_in",
+                    {"valueFrom": x[1]}
+                ),
+                zip(ids, new_value_froms)
+            )))
+        },
+        "run": get_identity_workflow(ids),
+        "out": list(ids)
+    }
+
+    redirections = dict(zip(
+        ids,
+        map(lambda x: f"{PROCESS_WORKFLOW_EXPRS}/{x}", ids)
+    ))
+
+    return new_workflow_step, (workflow_expr_step, workflow_expr_process_step), redirections
 
 def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
     def write_new_cwl(old_location, cwl):
@@ -246,14 +416,12 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
     eval_exprs_location = path.relpath(path.join(base_cwldir, "eval_exprs.cwl"), path.dirname(workflow_location))
 
     for i, step in enumerate(workflow_cwl["steps"]):
-        if isinstance(step, str):
-            step_id = step
-            step = workflow_cwl["steps"][step]
+        step_id = step["id"]
+        if isinstance(step["run"], str):
+            step_run_location = resolve_path(workflow_location, step["run"])
+            step_cwl = get_cwl(step_run_location)
         else:
-            step_id = step["id"]
-        step_run_location = resolve_path(workflow_location, step["run"])
-
-        step_cwl = get_cwl(step_run_location)
+            raise NotImplementedError()
 
         #### Init steps
         workflow_expr_step = None # type: JSONType
@@ -262,69 +430,10 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
         inputs_expr_step = None # type: JSONType
         output_processing_step = None # type: JSONType
 
-        workflow_expr_new_valuesFrom = {}
-        workflow_exprs = []
-        for step_in in map_to_array(step["in"]):
-            if isinstance(step_in, dict):
-                if step_in.get("valueFrom") is not None:
-                    found_expr = False
-                    def on_found_workflow_expr(expression):
-                        nonlocal found_expr
-                        found_expr = True
-                        workflow_exprs.append({"self": f'{step_in["id"]}', "expr": expression})
-                        return f"inputs.{OUTPUT_EXPR_SYMBOL}[{len(workflow_exprs) - 1}]"
-
-                    new_valueFrom = replace_expr(step_in["valueFrom"], on_found_workflow_expr)
-
-                    if found_expr:
-                        del get_cwl_map(get_cwl_map(new_workflow_cwl["steps"], step_id)["in"], step_in["id"])["valueFrom"]
-
-                        workflow_expr_new_valuesFrom[step_in["id"]] = new_valueFrom
-
-        if workflow_exprs != []:
-            if workflow_expression_lib is None:
-                workflow_expression_lib_dict = {}
-            else:
-                workflow_expression_lib_dict = {
-                    "expressionLib": {
-                        "default": ";".join(workflow_expression_lib)
-                    }
-                }
-
-            workflow_expr_step = {
-                "id": EVAL_WORKFLOW_EXPRS,
-                "run": eval_exprs_location,
-                "in": {
-                    "input_values": {
-                        "source": list(step["in"].keys())
-                    },
-                    "input_names": {
-                        "default": list(step["in"].keys())
-                    },
-                    "expressions": {
-                        "default": workflow_exprs
-                    },
-                    **workflow_expression_lib_dict
-                },
-                "out": ["output"]
-            }
-
-            workflow_expr_process_step = {
-                "id": PROCESS_WORKFLOW_EXPRS,
-                "in": {
-                    "__output_exprs": "__eval_workflow_exprs/output",
-                    **dict(list(map(
-                        lambda x: (
-                            x[0] + "_in",
-                            {"valueFrom": x[1]}
-                        ),
-                        workflow_expr_new_valuesFrom.items()
-                    )))
-                },
-                "run": get_identity_workflow(list(workflow_expr_new_valuesFrom.keys())),
-                "out": list(workflow_expr_new_valuesFrom.keys())
-            }
-
+        result = unjsify_workflow_exprs(step, eval_exprs_location, workflow_expression_lib)
+        new_workflow_cwl["steps"][i] = result[0]
+        workflow_expr_step, workflow_expr_process_step = result[1]
+        workflow_step_replacements = result[2]
 
         if step_cwl["class"] in ("CommandLineTool", "ExpressionTool"):
             js_req = get_cwl_map(step_cwl.get("requirements", []), "InlineJavascriptRequirement", "class")
@@ -332,7 +441,8 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
 
             if step_cwl["class"] == "ExpressionTool":
                 step_cwl["class"] = "CommandLineTool"
-                step_cwl["arguments"] = ["bash", "-c", f'echo {step_cwl["expression"]} > cwl.output.json']
+                step_cwl["arguments"] = ["bash", "-c", 'echo $0 | cut -c 2- > cwl.output.json', "|" + step_cwl["expression"]]
+                del step_cwl["expression"]
 
                 js_req = {}
 
@@ -347,6 +457,14 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                         "expressionLib": {"default": ";".join(js_req["expressionLib"])}
                     }
 
+                def add_defaults(step_input_name):
+                    if "default" in get_cwl_map(step_cwl["inputs"], step_input_name):
+                        default_value = get_cwl_map(step_cwl["inputs"], step_input_name)["default"]
+
+                        return [step_input_name, default_value]
+                    else:
+                        return step_input_name
+
                 if len(input_expressions) != 0:
                     inputs_expr_step = {
                         "id": EVAL_INPUT_EXPRS,
@@ -356,7 +474,7 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                                 "source": list(step["in"].keys())
                             },
                             "input_names": {
-                                "default": list(step["in"].keys())
+                                "default": list(map(add_defaults, step["in"].keys()))
                             },
                             "expressions": {
                                 "default": input_expressions
@@ -420,7 +538,7 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                             "id": step_id,
                             "in": {
                                 **dict(zip(step["in"].keys(), step["in"].keys())),
-                                **dict(zip(workflow_expr_new_valuesFrom.keys(), map(lambda x: f"{PROCESS_WORKFLOW_EXPRS}/{x}", workflow_expr_new_valuesFrom.keys()))),
+                                **dict(map(reversed, workflow_step_replacements.items())),
                                 **({EXPR_SYMBOL: f"{EVAL_INPUT_EXPRS}/output"} if inputs_expr_step is not None else {})
                             },
                             "out": step["out"],
@@ -431,20 +549,48 @@ def unjsify_workflow(workflow_location: str, outdir: str, base_cwldir: str):
                 }
 
         elif step_cwl["class"] == "Workflow":
-            unjsify_workflow(step_run_location, outdir, base_cwldir)
+            unjsify_workflow(step_run_location, outdir, base_cwldir, language)
         else:
             raise Exception(f'Unknown step type {step_cwl["class"]}')
 
     write_new_cwl(workflow_location, new_workflow_cwl)
 
-def inplace_nested_map(func, struct):
+def inplace_nested_leaf_map(func, struct):
     if isinstance(struct, dict):
         for key, value in struct.items():
-            struct[key] = inplace_nested_map(func, value)
+            struct[key] = inplace_nested_leaf_map(func, value)
         return struct
     elif isinstance(struct, list):
         for i, item in enumerate(struct):
-            struct[i] = inplace_nested_map(func, item)
+            struct[i] = inplace_nested_leaf_map(func, item)
+        return struct
+    else:
+        return func(struct)
+
+
+def inplace_nested_map_with_state(func, struct, state=None):
+    if state is None:
+        state = {}
+
+    if isinstance(struct, dict):
+        for key, value in struct.items():
+            struct[key] = inplace_nested_map_with_state(func, *func(value, copy.deepcopy(state)))
+        return struct
+    elif isinstance(struct, list):
+        for i, item in enumerate(struct):
+            struct[i] = inplace_nested_map_with_state(func, *func(item, copy.deepcopy(state)))
+        return struct
+    else:
+        return func(struct, copy.deepcopy(state))[0]
+
+def inplace_nested_map(func, struct):
+    if isinstance(struct, dict):
+        for key, value in struct.items():
+            struct[key] = inplace_nested_map(func, func(value))
+        return struct
+    elif isinstance(struct, list):
+        for i, item in enumerate(struct):
+            struct[i] = inplace_nested_map(func, func(item))
         return struct
     else:
         return func(struct)
@@ -522,7 +668,7 @@ def unjsify_tool(cwl):
         else:
             return node
 
-    inplace_nested_map(visit_cwl_node, cwl)
+    inplace_nested_leaf_map(visit_cwl_node, cwl)
     remove_cwl_map(cwl["requirements"], "InlineJavascriptRequirement", "class")
 
     if len(input_expressions) != 0:
@@ -538,15 +684,15 @@ def unjsify_tool(cwl):
 
 def main():
     parser = argparse.ArgumentParser(__name__)
-    parser.add_argument("cwl_workflow", help="Initial CWL workflow file to unjsify.")
+    parser.add_argument("cwl_workflow", help="Initial CWL workflow or tool to unjsify.")
     parser.add_argument("-b", "--base-dir", help="Base directory for the CWL files")
     parser.add_argument("-o", "--output", help="Output directory for results.")
+    parser.add_argument("--language", help="Language to use ('js' or 'python').", default="js")
     args = parser.parse_args()
 
     if args.base_dir is None:
         args.base_dir = path.dirname(args.cwl_workflow)
-
-    unjsify(args.cwl_workflow, args.output, args.base_dir)
+    unjsify(args.cwl_workflow, args.output, args.base_dir, args.language)
 
 if __name__ == "__main__":
     main()

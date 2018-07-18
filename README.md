@@ -17,7 +17,7 @@ $ ./nojscwltool test/test_workflow.cwl test/test_input.yaml
 
 ## Conformance tests
 
-To run the conformance tests, run the script `run_conformance_tests`. Note: not all of the confomance tests will pass, due to the reasons below.
+To run the conformance tests, run the script `run_conformance_tests`. Note: not all of the confomance tests will pass, due reasons specified below.
 
 ## Limitations
 - The runtime object is not passed into JavaScript expressions

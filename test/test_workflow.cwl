@@ -7,8 +7,6 @@ requirements:
 inputs:
   - id: number
     type: int
-    streamable: True
-    default: p
 
 steps:
   - id: test_tool_num1
@@ -18,6 +16,7 @@ steps:
         source: number
         valueFrom: $(true?self:self)
     out: []
+
   - id: test_tool_num2
     run: ./test_tool.cwl
     in:

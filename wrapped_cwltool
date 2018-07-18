@@ -1,0 +1,102 @@
+#!/usr/bin/env python
+import argparse
+import os
+import tempfile
+import sys
+import subprocess
+from os import path
+import ruamel.yaml as yaml
+import json
+import copy
+
+parser = argparse.ArgumentParser()
+parser.add_argument("cwl")
+parser.add_argument("input")
+parser.add_argument("--outdir")
+parser.add_argument("--quiet", action='store_true')
+args = parser.parse_args()
+
+def iterate(func):
+    while True:
+        yield func()
+
+def get_map_keys(cwl_map, id_token="id"):
+    if isinstance(cwl_map, dict):
+        return list(cwl_map.keys())
+    else:
+        return list(map(lambda x: x[id_token], cwl_map))
+
+def get_cwl_map(cwl_map, name, id_token="id"):
+    if isinstance(cwl_map, dict):
+        return cwl_map.get(name)
+    else:
+        for element in cwl_map:
+            if element[id_token] == name:
+                return element
+
+cwl_file_cache = {} # type: Dict[str, Any]
+
+def get_cwl(cwl_path):
+    global cwl_file_cache
+    # if cwl_path[:5] != "file:":
+    #     cwl_path = f"file://{path.abspath(cwl_path)}"
+
+    # document_loader, workflowobj, uri = fetch_document(cwl_path)
+    # document_loader, _, _, _, _ = validate_document(document_loader, workflowobj, uri, strict=False, preprocess_only=True)
+    # return document_loader.resolve_ref(uri)[0]
+
+    hash_pos = cwl_path.find("#")
+
+    if hash_pos != -1:
+        hash_part = cwl_path[hash_pos+1:]
+        cwl_path = cwl_path[:hash_pos]
+
+    if cwl_file_cache.get(cwl_path) is not None:
+        cwl = cwl_file_cache[cwl_path]
+    else:
+        with open(cwl_path) as fp:
+            cwl = yaml.load(fp, Loader=yaml.Loader)
+
+        cwl_file_cache[cwl_path] = copy.deepcopy(cwl)
+
+    if hash_pos != -1:
+        return get_cwl_map(cwl["$graph"], hash_part)
+
+    return cwl
+
+def steralize_name(name: str):
+    return name.replace("#", "")
+
+def main():
+    cwl_path = args.cwl
+
+    wrapper_file = tempfile.mkstemp("wrapper.json")[1]
+
+    cwl = get_cwl(cwl_path)
+    inputs_ids = list(map(steralize_name, get_map_keys(cwl["inputs"], "id")))
+
+    workflow_wrapper = {
+        "cwlVersion": "v1.0",
+        "class": "Workflow",
+        "inputs": dict(zip(inputs_ids, iterate(lambda: {"type": "Any?"}))),
+        "outputs": dict(map(lambda x: (x, {"outputSource": "inner_cwl/" + x, "type": "Any?"}),
+            get_map_keys(cwl["outputs"], "id"))),
+        "requirements": [{
+            "class": "SubworkflowFeatureRequirement"
+        }],
+        "steps": [{
+            "id": "inner_cwl",
+            "run": path.abspath(cwl_path),
+            "in": dict(zip(inputs_ids, inputs_ids)),
+            "out": list(get_map_keys(cwl["outputs"], "id"))
+        }]
+    }
+
+    with open(wrapper_file, "w") as fp:
+        json.dump(workflow_wrapper, fp, indent=4)
+
+    print("cwltool --outdir %s %s %s" % (args.outdir, wrapper_file, args.input), file=sys.stderr)
+    subprocess.check_call("cwltool --quiet --outdir %s %s %s" % (args.outdir, wrapper_file, args.input), shell=True)
+
+if __name__ == "__main__":
+    main()
